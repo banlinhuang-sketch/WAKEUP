@@ -13,6 +13,7 @@ import numpy as np
 
 from voice_wakeup_tester import audio
 from voice_wakeup_tester.audio import (
+    AudioDependencyError,
     AudioValidationError,
     list_output_devices,
     load_wav_asset,
@@ -113,6 +114,17 @@ class AudioTests(unittest.TestCase):
         self.assertTrue(devices[1]["is_bluetooth"])
         self.assertFalse(devices[1]["is_handsfree"])
         self.assertTrue(devices[2]["is_handsfree"])
+
+    def test_require_sounddevice_reports_underlying_import_error(self) -> None:
+        """底层导入失败时，应保留可用于排查的原始错误信息。"""
+        with mock.patch.object(audio, "sd", None), mock.patch.object(
+            audio, "_SOUNDDEVICE_IMPORT_ERROR", OSError("PortAudio DLL load failed")
+        ):
+            with self.assertRaises(AudioDependencyError) as context:
+                audio._require_sounddevice()
+
+        self.assertIn("PortAudio DLL load failed", str(context.exception))
+        self.assertIn("_internal", str(context.exception))
 
 
 if __name__ == "__main__":

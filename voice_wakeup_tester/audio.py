@@ -15,8 +15,10 @@ import numpy as np
 
 try:
     import sounddevice as sd
-except ImportError:  # pragma: no cover - exercised by environment checks instead
+    _SOUNDDEVICE_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - exercised by environment checks instead
     sd = None
+    _SOUNDDEVICE_IMPORT_ERROR = exc
 
 
 class AudioValidationError(RuntimeError):
@@ -68,8 +70,16 @@ class AudioAsset:
 def _require_sounddevice():
     """确保运行环境已经安装 sounddevice。"""
     if sd is None:
+        detail = ""
+        if _SOUNDDEVICE_IMPORT_ERROR is not None:
+            detail = (
+                f" Underlying error: {type(_SOUNDDEVICE_IMPORT_ERROR).__name__}: "
+                f"{_SOUNDDEVICE_IMPORT_ERROR}"
+            )
         raise AudioDependencyError(
-            "sounddevice is not installed. Install it with `pip install sounddevice`."
+            "sounddevice is unavailable. "
+            "If you are running the packaged EXE, keep the executable and `_internal` directory together."
+            f"{detail}"
         )
     return sd
 
