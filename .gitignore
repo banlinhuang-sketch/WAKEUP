@@ -1,0 +1,12 @@
+.idea/
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+runs/
+
+last_config.yaml
+

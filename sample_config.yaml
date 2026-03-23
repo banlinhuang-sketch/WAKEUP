@@ -1,0 +1,32 @@
+platform: rtos
+dut:
+  serial_port: COM3
+  baudrate: 115200
+  adb_serial: ""
+audio_devices:
+  mouth_output: 'Your Mouth Device'
+  noise_output: 'Your Noise Device'
+match_rules:
+  - type: keyword
+    pattern: WAKEUP_SUCCESS
+timing:
+  pre_noise_roll_ms: 2000
+  trial_interval_ms: 5000
+  success_window_ms: 3000
+allow_same_device: false
+output_root: ""
+scenarios:
+  - name: office_55db
+    noise_file: 'C:\audio\office.wav'
+    noise_gain_db: -3.0
+    wakeup_file: 'C:\audio\wakeup.wav'
+    wakeup_gain_db: 0.0
+    trials: 20
+    enabled: true
+  - name: subway_65db
+    noise_file: 'C:\audio\subway.wav'
+    noise_gain_db: 0.0
+    wakeup_file: 'C:\audio\wakeup.wav'
+    wakeup_gain_db: 0.0
+    trials: 20
+    enabled: true
