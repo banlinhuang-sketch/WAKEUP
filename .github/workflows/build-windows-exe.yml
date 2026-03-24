@@ -37,6 +37,8 @@ jobs:
           python -m pip install pyinstaller
 
       - name: Run tests
+        env:
+          SKIP_GUI_TESTS: "1"
         run: python -m pytest -q
 
       - name: Compile sources

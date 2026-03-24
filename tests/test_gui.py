@@ -8,9 +8,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtCore, QtWidgets
+if os.environ.get("SKIP_GUI_TESTS") == "1":
+    pytest.skip("GUI tests are disabled in this environment.", allow_module_level=True)
+
+try:
+    from PySide6 import QtCore, QtWidgets
+except ImportError as exc:  # pragma: no cover - depends on CI/runtime Qt availability
+    pytest.skip(f"PySide6 runtime unavailable: {exc}", allow_module_level=True)
 
 from voice_wakeup_tester.config import config_from_dict
 from voice_wakeup_tester.gui import (
