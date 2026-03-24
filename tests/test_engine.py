@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -12,8 +14,15 @@ import numpy as np
 from voice_wakeup_tester.audio import AudioValidationError
 from voice_wakeup_tester.config import config_from_dict
 from voice_wakeup_tester.dut import SyntheticLogSource
-from voice_wakeup_tester.engine import TestEngine
-from voice_wakeup_tester.models import LogEvent, TRIAL_STATUS_FAIL, TRIAL_STATUS_PASS, TrialResult
+from voice_wakeup_tester.engine import EngineCallbacks, TestEngine
+from voice_wakeup_tester.models import (
+    LogEvent,
+    TRIAL_STATUS_FAIL,
+    TRIAL_STATUS_PASS,
+    TRIAL_STATUS_SKIPPED,
+    TRIAL_STATUS_STOPPED,
+    TrialResult,
+)
 
 
 def write_silence_wav(path: Path, sample_rate: int = 16000, duration_seconds: float = 0.05) -> None:
@@ -32,6 +41,113 @@ class BurstSyntheticLogSource(SyntheticLogSource):
     def inject_line_after(self, delay_seconds: float, source: str, line: str) -> None:
         super().inject_line_after(delay_seconds, source, line)
         super().inject_line_after(delay_seconds + 0.02, source, line)
+
+
+class RecordingPlaybackHandle:
+    """Minimal playback handle used by runtime tests."""
+
+    def __init__(self):
+        self.started_at_monotonic = time.monotonic()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return True
+
+    def stop(self) -> None:
+        return None
+
+
+class RecordingNoiseHandle:
+    """Track when the noise loop is asked to stop."""
+
+    def __init__(self):
+        self.stop_calls = 0
+        self.first_stop_monotonic: float | None = None
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        if self.first_stop_monotonic is None:
+            self.first_stop_monotonic = time.monotonic()
+
+
+class InterruptiblePlaybackHandle:
+    """可被停止请求中断的单次播放假句柄。"""
+
+    def __init__(self):
+        self.started_at_monotonic = time.monotonic()
+        self.stop_calls = 0
+        self._done = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._done.wait(timeout=timeout)
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._done.set()
+
+
+class InterruptibleNoiseHandle:
+    """记录噪声停止请求次数的假句柄。"""
+
+    def __init__(self):
+        self.stop_calls = 0
+        self._done = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._done.set()
+
+
+class InterruptibleAudioBackend:
+    """用于停止链路测试的内存音频后端。"""
+
+    def __init__(self):
+        self.playback_handles: list[InterruptiblePlaybackHandle] = []
+        self.noise_handles: list[InterruptibleNoiseHandle] = []
+
+    def validate_output(self, _selection, _asset) -> None:
+        return None
+
+    def start_noise_loop(self, _selection, _asset) -> InterruptibleNoiseHandle:
+        handle = InterruptibleNoiseHandle()
+        self.noise_handles.append(handle)
+        return handle
+
+    def play_once(self, _selection, _asset) -> InterruptiblePlaybackHandle:
+        handle = InterruptiblePlaybackHandle()
+        self.playback_handles.append(handle)
+        return handle
+
+
+class IdleLogSource:
+    """不主动注入日志的静默日志源。"""
+
+    def precheck(self) -> None:
+        return None
+
+    def start(self, line_callback, error_callback) -> None:
+        self._line_callback = line_callback
+        self._error_callback = error_callback
+
+    def stop(self) -> None:
+        return None
+
+
+class RecordingAudioBackend:
+    """In-memory audio backend for custom-noise-duration tests."""
+
+    def __init__(self):
+        self.noise_handles: list[RecordingNoiseHandle] = []
+
+    def validate_output(self, _selection, _asset) -> None:
+        return None
+
+    def start_noise_loop(self, _selection, _asset) -> RecordingNoiseHandle:
+        handle = RecordingNoiseHandle()
+        self.noise_handles.append(handle)
+        return handle
+
+    def play_once(self, _selection, _asset) -> RecordingPlaybackHandle:
+        return RecordingPlaybackHandle()
 
 
 class EngineTests(unittest.TestCase):
@@ -196,6 +312,130 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(any("success_window_ms: 5000" in message for message in messages))
             self.assertTrue(any("trials: 5" in message for message in messages))
 
+    def test_precheck_reports_noise_playback_duration_for_each_scenario(self) -> None:
+        """Precheck should show whether a scenario uses full-scene noise or a custom duration."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "scenarios": [
+                        {
+                            "name": "full_scene",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 1,
+                        },
+                        {
+                            "name": "timed_scene",
+                            "noise_file": str(noise),
+                            "noise_playback_duration_ms": 1800,
+                            "wakeup_file": str(wakeup),
+                            "trials": 1,
+                        },
+                    ],
+                }
+            )
+
+            class StubLogSource:
+                def precheck(self) -> None:
+                    return None
+
+            engine = TestEngine(config=config, dry_run=True, log_source_factory=lambda **_kwargs: StubLogSource())
+            messages = engine.precheck()
+
+            self.assertTrue(any("full_scene" in message and "整场景" in message for message in messages))
+            self.assertTrue(any("timed_scene" in message and "1800 ms" in message for message in messages))
+
+    def test_custom_noise_duration_stops_noise_and_keeps_remaining_trials_running(self) -> None:
+        """Custom noise duration should stop the noise loop without interrupting later trials."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 50,
+                        "success_window_ms": 200,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "office",
+                            "noise_file": str(noise),
+                            "noise_playback_duration_ms": 30,
+                            "wakeup_file": str(wakeup),
+                            "trials": 3,
+                        }
+                    ],
+                }
+            )
+
+            backend = RecordingAudioBackend()
+            statuses: list[str] = []
+            engine = TestEngine(config=config, dry_run=True, audio_backend=backend)
+
+            summary = engine.run(callbacks=EngineCallbacks(on_status=statuses.append))
+
+            self.assertEqual(summary["overall"]["total_trials"], 3)
+            self.assertTrue(all(result.status == TRIAL_STATUS_PASS for result in engine.trial_results))
+            self.assertEqual(len(backend.noise_handles), 1)
+            self.assertEqual(backend.noise_handles[0].stop_calls, 1)
+            self.assertTrue(any("30 ms" in message and "后续试次继续执行" in message for message in statuses))
+
+    def test_default_noise_duration_does_not_emit_custom_stop_message(self) -> None:
+        """Unset noise duration should keep default behavior and avoid custom-stop status text."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 30,
+                        "success_window_ms": 150,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "office",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 2,
+                        }
+                    ],
+                }
+            )
+
+            backend = RecordingAudioBackend()
+            statuses: list[str] = []
+            engine = TestEngine(config=config, dry_run=True, audio_backend=backend)
+
+            summary = engine.run(callbacks=EngineCallbacks(on_status=statuses.append))
+
+            self.assertEqual(summary["overall"]["total_trials"], 2)
+            self.assertEqual(backend.noise_handles[0].stop_calls, 1)
+            self.assertFalse(any("噪声已按自定义时长" in message for message in statuses))
+
     def test_annotate_late_matches_for_reports_marks_late_hit(self) -> None:
         """Late matches should be attached to the failed trial for reporting."""
         config = config_from_dict(
@@ -274,6 +514,163 @@ class EngineTests(unittest.TestCase):
             engine.precheck()
 
         self.assertIn("路径为空", str(context.exception))
+
+    def test_request_stop_interrupts_active_run_audio_and_marks_trial_stopped(self) -> None:
+        """用户停止时应同时中断当前唤醒词和噪声，并把当前试次标为 STOPPED。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 50,
+                        "success_window_ms": 500,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "office",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 2,
+                        }
+                    ],
+                }
+            )
+
+            backend = InterruptibleAudioBackend()
+            engine = TestEngine(
+                config=config,
+                dry_run=True,
+                audio_backend=backend,
+                log_source_factory=lambda **_kwargs: IdleLogSource(),
+            )
+            summary_box: dict[str, object] = {}
+
+            run_thread = threading.Thread(
+                target=lambda: summary_box.setdefault("summary", engine.run()),
+                daemon=True,
+            )
+            run_thread.start()
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not backend.playback_handles:
+                time.sleep(0.01)
+
+            self.assertTrue(backend.playback_handles)
+            self.assertTrue(backend.noise_handles)
+
+            engine.request_stop()
+            run_thread.join(timeout=3.0)
+
+            self.assertFalse(run_thread.is_alive())
+            self.assertEqual(engine.trial_results[0].status, TRIAL_STATUS_STOPPED)
+            self.assertTrue(all(result.status == TRIAL_STATUS_SKIPPED for result in engine.trial_results[1:]))
+            self.assertGreaterEqual(backend.playback_handles[0].stop_calls, 1)
+            self.assertGreaterEqual(backend.noise_handles[0].stop_calls, 1)
+            self.assertIsNone(engine._active_playback_handle)
+            self.assertIsNone(engine._active_noise_handle)
+
+    def test_preview_asset_returns_stopped_when_user_interrupts(self) -> None:
+        """试听模式被用户停止时应尽快停声并返回 stopped 状态。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            write_silence_wav(wakeup)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "scenarios": [
+                        {
+                            "name": "office",
+                            "noise_file": str(wakeup),
+                            "wakeup_file": str(wakeup),
+                            "trials": 1,
+                        }
+                    ],
+                }
+            )
+
+            backend = InterruptibleAudioBackend()
+            engine = TestEngine(config=config, dry_run=True, audio_backend=backend)
+            result_box: dict[str, object] = {}
+
+            preview_thread = threading.Thread(
+                target=lambda: result_box.setdefault(
+                    "stopped",
+                    engine.preview_asset(str(wakeup), "", gain_db=0.0),
+                ),
+                daemon=True,
+            )
+            preview_thread.start()
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not backend.playback_handles:
+                time.sleep(0.01)
+
+            self.assertTrue(backend.playback_handles)
+
+            engine.request_stop()
+            preview_thread.join(timeout=2.0)
+
+            self.assertFalse(preview_thread.is_alive())
+            self.assertTrue(result_box.get("stopped"))
+            self.assertGreaterEqual(backend.playback_handles[0].stop_calls, 1)
+            self.assertIsNone(engine._active_playback_handle)
+
+    def test_request_stop_is_idempotent_during_preview(self) -> None:
+        """重复停止同一段试听不应导致异常或卡住线程。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            write_silence_wav(wakeup)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "scenarios": [
+                        {
+                            "name": "office",
+                            "noise_file": str(wakeup),
+                            "wakeup_file": str(wakeup),
+                            "trials": 1,
+                        }
+                    ],
+                }
+            )
+
+            backend = InterruptibleAudioBackend()
+            engine = TestEngine(config=config, dry_run=True, audio_backend=backend)
+
+            preview_thread = threading.Thread(
+                target=lambda: engine.preview_asset(str(wakeup), "", gain_db=0.0),
+                daemon=True,
+            )
+            preview_thread.start()
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not backend.playback_handles:
+                time.sleep(0.01)
+
+            self.assertTrue(backend.playback_handles)
+
+            engine.request_stop()
+            engine.request_stop()
+            preview_thread.join(timeout=2.0)
+
+            self.assertFalse(preview_thread.is_alive())
+            self.assertGreaterEqual(backend.playback_handles[0].stop_calls, 1)
+            self.assertIsNone(engine._active_playback_handle)
 
 
 if __name__ == "__main__":

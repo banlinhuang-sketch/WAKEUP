@@ -16,13 +16,40 @@ from .config import default_config, load_config, save_config
 from .dut import LogSourceError, list_adb_devices, list_serial_port_names
 from .engine import EngineCallbacks, TestEngine
 from .matching import parse_rules_text, rules_to_text
-from .models import AppConfig, AudioDeviceConfig, DutConfig, ScenarioConfig, TimingConfig
+from .models import (
+    AppConfig,
+    AudioDeviceConfig,
+    DutConfig,
+    ScenarioConfig,
+    TRIAL_STATUS_STOPPED,
+    TimingConfig,
+)
 
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
 except ImportError as exc:  # pragma: no cover - depends on host environment
     raise RuntimeError("PySide6 is required for GUI mode.") from exc
+
+
+SCENARIO_COL_ENABLED = 0
+SCENARIO_COL_NAME = 1
+SCENARIO_COL_NOISE_FILE = 2
+SCENARIO_COL_NOISE_GAIN = 3
+SCENARIO_COL_NOISE_DURATION = 4
+SCENARIO_COL_WAKEUP_FILE = 5
+SCENARIO_COL_WAKEUP_GAIN = 6
+SCENARIO_COL_TRIALS = 7
+SCENARIO_TABLE_HEADERS = [
+    "启用",
+    "名称",
+    "噪声文件",
+    "噪声增益(dB)",
+    "噪声时长(ms)",
+    "唤醒文件",
+    "唤醒增益(dB)",
+    "轮数",
+]
 
 
 class EngineWorker(QtCore.QObject):
@@ -71,7 +98,15 @@ class EngineWorker(QtCore.QObject):
                         on_progress=self.progress.emit,
                     )
                 )
-                self.done.emit({"mode": "run", "summary": summary})
+                self.done.emit(
+                    {
+                        "mode": "run",
+                        "summary": summary,
+                        "stopped": any(
+                            result.status == TRIAL_STATUS_STOPPED for result in self._engine.trial_results
+                        ),
+                    }
+                )
                 return
             if self._mode == "precheck":
                 messages = self._engine.precheck()
@@ -81,8 +116,12 @@ class EngineWorker(QtCore.QObject):
                 return
             if self._mode == "preview":
                 self.status.emit(f"试听: {self._preview_asset}")
-                self._engine.preview_asset(self._preview_asset, self._preview_device, self._preview_gain_db)
-                self.done.emit({"mode": "preview", "asset": self._preview_asset})
+                stopped = self._engine.preview_asset(
+                    self._preview_asset,
+                    self._preview_device,
+                    self._preview_gain_db,
+                )
+                self.done.emit({"mode": "preview", "asset": self._preview_asset, "stopped": stopped})
                 return
             raise ValueError(f"Unsupported worker mode: {self._mode}")
         except Exception as exc:
@@ -101,7 +140,6 @@ class EngineWorker(QtCore.QObject):
 
 class MainWindow(QtWidgets.QMainWindow):
     """主操作台窗口。"""
-    stop_requested = QtCore.Signal()
 
     def __init__(self, project_root: Path, initial_config: AppConfig | None = None, dry_run: bool = False):
         """初始化窗口、恢复配置并刷新设备列表。"""
@@ -251,14 +289,13 @@ class MainWindow(QtWidgets.QMainWindow):
         scenario_group = QtWidgets.QGroupBox("批量场景表")
         scenario_layout = QtWidgets.QVBoxLayout(scenario_group)
         # 场景表是批量回归的核心配置区域。
-        self.scenario_table = QtWidgets.QTableWidget(0, 7)
-        self.scenario_table.setHorizontalHeaderLabels(
-            ["启用", "名称", "噪声文件", "噪声增益(dB)", "唤醒文件", "唤醒增益(dB)", "轮数"]
-        )
+        self.scenario_table = QtWidgets.QTableWidget(0, len(SCENARIO_TABLE_HEADERS))
+        self.scenario_table.setHorizontalHeaderLabels(SCENARIO_TABLE_HEADERS)
         self.scenario_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.scenario_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         header = self.scenario_table.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        for column in range(1, 7):
+        header.setSectionResizeMode(SCENARIO_COL_ENABLED, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        for column in range(1, len(SCENARIO_TABLE_HEADERS)):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Stretch)
         scenario_layout.addWidget(self.scenario_table)
 
@@ -280,23 +317,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.custom_trials_spin.setValue(10)
         self.custom_trials_spin.setSuffix(" 次")
         self.custom_trials_spin.setToolTip("快速设置场景试次，无需手动编辑表格中的“次数”列。")
+        self._custom_trials_user_value = self.custom_trials_spin.value()
+        self.custom_trials_spin.valueChanged.connect(self._remember_custom_trials_input)
         self.apply_selected_trials_button = QtWidgets.QPushButton("应用到选中场景")
+        self.apply_enabled_trials_button = QtWidgets.QPushButton("应用到启用场景")
         self.apply_all_trials_button = QtWidgets.QPushButton("应用到全部场景")
         custom_trials_row.addWidget(QtWidgets.QLabel("自定义次数"))
         custom_trials_row.addWidget(self.custom_trials_spin)
         custom_trials_row.addWidget(self.apply_selected_trials_button)
+        custom_trials_row.addWidget(self.apply_enabled_trials_button)
         custom_trials_row.addWidget(self.apply_all_trials_button)
         custom_trials_row.addStretch(1)
         scenario_layout.addLayout(custom_trials_row)
+        self.custom_trials_hint_label = QtWidgets.QLabel("当前没有场景；设置的次数会用于后续新增场景。")
+        self.custom_trials_hint_label.setWordWrap(True)
+        scenario_layout.addWidget(self.custom_trials_hint_label)
         left_layout.addWidget(scenario_group)
 
         self.add_scenario_button.clicked.connect(self._append_empty_scenario)
         self.remove_scenario_button.clicked.connect(self._remove_selected_scenario)
-        self.browse_noise_button.clicked.connect(lambda: self._browse_scenario_file(column=2))
-        self.browse_wakeup_button.clicked.connect(lambda: self._browse_scenario_file(column=4))
+        self.browse_noise_button.clicked.connect(lambda: self._browse_scenario_file(column=SCENARIO_COL_NOISE_FILE))
+        self.browse_wakeup_button.clicked.connect(lambda: self._browse_scenario_file(column=SCENARIO_COL_WAKEUP_FILE))
         self.apply_selected_trials_button.clicked.connect(self._apply_custom_trials_to_selected)
+        self.apply_enabled_trials_button.clicked.connect(self._apply_custom_trials_to_enabled)
         self.apply_all_trials_button.clicked.connect(self._apply_custom_trials_to_all)
-        self.scenario_table.itemSelectionChanged.connect(self._sync_custom_trials_from_selected_row)
+        self.scenario_table.itemSelectionChanged.connect(self._sync_custom_trials_from_selection)
 
         action_row = QtWidgets.QHBoxLayout()
         self.load_config_button = QtWidgets.QPushButton("加载配置")
@@ -556,6 +601,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 name=f"scene_{self.scenario_table.rowCount() + 1}",
                 noise_file="",
                 wakeup_file="",
+                noise_playback_duration_ms=0,
                 trials=self.custom_trials_spin.value(),
             )
         )
@@ -570,81 +616,168 @@ class MainWindow(QtWidgets.QMainWindow):
         enabled_item.setCheckState(
             QtCore.Qt.CheckState.Checked if scenario.enabled else QtCore.Qt.CheckState.Unchecked
         )
-        self.scenario_table.setItem(row, 0, enabled_item)
-        self.scenario_table.setItem(row, 1, QtWidgets.QTableWidgetItem(scenario.name))
-        self.scenario_table.setItem(row, 2, QtWidgets.QTableWidgetItem(scenario.noise_file))
-        self.scenario_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(scenario.noise_gain_db)))
-        self.scenario_table.setItem(row, 4, QtWidgets.QTableWidgetItem(scenario.wakeup_file))
-        self.scenario_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(scenario.wakeup_gain_db)))
-        self.scenario_table.setItem(row, 6, QtWidgets.QTableWidgetItem(str(scenario.trials)))
+        self.scenario_table.setItem(row, SCENARIO_COL_ENABLED, enabled_item)
+        self.scenario_table.setItem(row, SCENARIO_COL_NAME, QtWidgets.QTableWidgetItem(scenario.name))
+        self.scenario_table.setItem(row, SCENARIO_COL_NOISE_FILE, QtWidgets.QTableWidgetItem(scenario.noise_file))
+        self.scenario_table.setItem(
+            row,
+            SCENARIO_COL_NOISE_GAIN,
+            QtWidgets.QTableWidgetItem(str(scenario.noise_gain_db)),
+        )
+        self.scenario_table.setItem(
+            row,
+            SCENARIO_COL_NOISE_DURATION,
+            QtWidgets.QTableWidgetItem(str(scenario.noise_playback_duration_ms)),
+        )
+        self.scenario_table.setItem(row, SCENARIO_COL_WAKEUP_FILE, QtWidgets.QTableWidgetItem(scenario.wakeup_file))
+        self.scenario_table.setItem(
+            row,
+            SCENARIO_COL_WAKEUP_GAIN,
+            QtWidgets.QTableWidgetItem(str(scenario.wakeup_gain_db)),
+        )
+        self.scenario_table.setItem(row, SCENARIO_COL_TRIALS, QtWidgets.QTableWidgetItem(str(scenario.trials)))
         self.scenario_table.selectRow(row)
-        self._sync_custom_trials_from_selected_row()
-
-    def _selected_scenario_row(self) -> int:
-        """返回当前选中的场景行号；只有一行时默认落到首行。"""
-        row = self.scenario_table.currentRow()
-        if row >= 0:
-            return row
-        if self.scenario_table.rowCount() == 1:
-            return 0
-        return -1
+        self._sync_custom_trials_from_selection()
 
     def _set_scenario_trials(self, row: int, trials: int) -> None:
         """更新指定场景行的试次数字。"""
-        item = self.scenario_table.item(row, 6)
+        item = self.scenario_table.item(row, SCENARIO_COL_TRIALS)
         if item is None:
             item = QtWidgets.QTableWidgetItem(str(trials))
-            self.scenario_table.setItem(row, 6, item)
+            self.scenario_table.setItem(row, SCENARIO_COL_TRIALS, item)
             return
         item.setText(str(trials))
 
-    def _sync_custom_trials_from_selected_row(self) -> None:
-        """把选中场景的试次回填到自定义次数输入框。"""
-        row = self._selected_scenario_row()
-        if row < 0:
-            return
-        item = self.scenario_table.item(row, 6)
+    def _scenario_trials_value(self, row: int) -> int | None:
+        """读取指定场景行的试次值；无效时返回 `None`。"""
+        item = self.scenario_table.item(row, SCENARIO_COL_TRIALS)
         if item is None:
-            return
+            return None
         try:
             trials = int(item.text().strip())
         except ValueError:
-            return
+            return None
         if trials <= 0:
+            return None
+        return trials
+
+    def _selected_scenario_rows(self) -> list[int]:
+        """返回当前多选场景行号，结果去重并按表格顺序排序。"""
+        selection_model = self.scenario_table.selectionModel()
+        if selection_model is None:
+            return []
+        return sorted({index.row() for index in selection_model.selectedRows()})
+
+    def _enabled_scenario_rows(self) -> list[int]:
+        """返回当前已启用场景的行号集合。"""
+        rows: list[int] = []
+        for row in range(self.scenario_table.rowCount()):
+            item = self.scenario_table.item(row, SCENARIO_COL_ENABLED)
+            if item is not None and item.checkState() == QtCore.Qt.CheckState.Checked:
+                rows.append(row)
+        return rows
+
+    def _all_scenario_rows(self) -> list[int]:
+        """返回场景表中的全部行号。"""
+        return list(range(self.scenario_table.rowCount()))
+
+    def _scenario_rows_for_scope(self, scope: str) -> list[int]:
+        """按作用域返回目标场景行集合。"""
+        if scope == "selected":
+            return self._selected_scenario_rows()
+        if scope == "enabled":
+            return self._enabled_scenario_rows()
+        if scope == "all":
+            return self._all_scenario_rows()
+        raise ValueError(f"Unsupported trial scope: {scope}")
+
+    def _remember_custom_trials_input(self, value: int) -> None:
+        """记住用户最近一次手动输入的自定义次数。"""
+        self._custom_trials_user_value = value
+
+    def _sync_custom_trials_from_selection(self) -> None:
+        """根据当前选中场景回填或提示自定义次数状态。"""
+        selected_rows = self._selected_scenario_rows()
+        if not selected_rows:
+            if self.scenario_table.rowCount() == 0:
+                self.custom_trials_hint_label.setText("当前没有场景；设置的次数会用于后续新增场景。")
+            else:
+                self.custom_trials_hint_label.setText("未选中场景；当前输入值会用于新增场景，或在批量设置时写入目标场景。")
             return
+
+        trial_values: list[int] = []
+        for row in selected_rows:
+            trials = self._scenario_trials_value(row)
+            if trials is None:
+                self.custom_trials_hint_label.setText("选中场景里存在无效试次值；请先修正“轮数”列后再批量设置。")
+                return
+            trial_values.append(trials)
+
+        unique_values = sorted(set(trial_values))
+        if len(unique_values) == 1:
+            trials = unique_values[0]
+            self.custom_trials_spin.blockSignals(True)
+            self.custom_trials_spin.setValue(trials)
+            self.custom_trials_spin.blockSignals(False)
+            if len(selected_rows) == 1:
+                self.custom_trials_hint_label.setText(f"已选中 1 条场景，当前试次为 {trials} 次。")
+            else:
+                self.custom_trials_hint_label.setText(
+                    f"已选中 {len(selected_rows)} 条场景，当前试次均为 {trials} 次。"
+                )
+            return
+
         self.custom_trials_spin.blockSignals(True)
-        self.custom_trials_spin.setValue(trials)
+        self.custom_trials_spin.setValue(self._custom_trials_user_value)
         self.custom_trials_spin.blockSignals(False)
+        self.custom_trials_hint_label.setText(
+            f"已选中 {len(selected_rows)} 条场景，试次不一致；当前输入 {self.custom_trials_spin.value()} 次将用于后续批量设置。"
+        )
 
-    def _apply_custom_trials_to_selected(self) -> None:
-        """将自定义次数应用到当前选中的场景。"""
-        row = self._selected_scenario_row()
-        if row < 0:
-            QtWidgets.QMessageBox.information(self, "自定义次数", "请先选中一条场景。")
-            return
-        trials = self.custom_trials_spin.value()
-        self._set_scenario_trials(row, trials)
-        self.scenario_table.selectRow(row)
-        self.status_label.setText(f"已将试次设置为 {trials} 次")
-
-    def _apply_custom_trials_to_all(self) -> None:
-        """将自定义次数批量应用到全部场景。"""
+    def _apply_custom_trials(self, scope: str) -> None:
+        """按给定作用域批量应用自定义次数。"""
         row_count = self.scenario_table.rowCount()
         if row_count == 0:
             QtWidgets.QMessageBox.information(self, "自定义次数", "请先添加至少一条场景。")
             return
+
+        target_rows = self._scenario_rows_for_scope(scope)
+        if not target_rows:
+            if scope == "selected":
+                QtWidgets.QMessageBox.information(self, "自定义次数", "请先选中至少一条场景。")
+                return
+            if scope == "enabled":
+                QtWidgets.QMessageBox.information(self, "自定义次数", "请先至少启用一条场景。")
+                return
+
         trials = self.custom_trials_spin.value()
-        for row in range(row_count):
+        for row in target_rows:
             self._set_scenario_trials(row, trials)
-        self._sync_custom_trials_from_selected_row()
-        self.status_label.setText(f"已将全部场景试次设置为 {trials} 次")
+        self._sync_custom_trials_from_selection()
+        if scope == "all":
+            self.status_label.setText(f"已将全部 {len(target_rows)} 条场景的试次设置为 {trials} 次")
+            return
+        scope_label = "选中场景" if scope == "selected" else "启用场景"
+        self.status_label.setText(f"已将 {len(target_rows)} 条{scope_label}的试次设置为 {trials} 次")
+
+    def _apply_custom_trials_to_selected(self) -> None:
+        """将自定义次数应用到当前选中的一个或多个场景。"""
+        self._apply_custom_trials("selected")
+
+    def _apply_custom_trials_to_enabled(self) -> None:
+        """将自定义次数批量应用到当前启用的场景。"""
+        self._apply_custom_trials("enabled")
+
+    def _apply_custom_trials_to_all(self) -> None:
+        """将自定义次数批量应用到全部场景。"""
+        self._apply_custom_trials("all")
 
     def _remove_selected_scenario(self) -> None:
         """删除当前选中的场景行。"""
         row = self.scenario_table.currentRow()
         if row >= 0:
             self.scenario_table.removeRow(row)
-            self._sync_custom_trials_from_selected_row()
+            self._sync_custom_trials_from_selection()
 
     def _browse_scenario_file(self, column: int) -> None:
         """为当前行选择噪声或唤醒词 WAV 文件。"""
@@ -662,22 +795,56 @@ class MainWindow(QtWidgets.QMainWindow):
         if directory:
             self.output_root_edit.setText(directory)
 
+    def _scenario_non_negative_int(self, row: int, column: int) -> int:
+        """Read a non-negative integer cell from the scenario table."""
+        item = self.scenario_table.item(row, column)
+        raw_text = item.text().strip() if item is not None else "0"
+        return max(int(raw_text or 0), 0)
+
     def _config_from_ui(self) -> AppConfig:
         """把当前界面内容收敛为配置对象。"""
         scenarios: list[ScenarioConfig] = []
         for row in range(self.scenario_table.rowCount()):
-            enabled = self.scenario_table.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked
-            name = (self.scenario_table.item(row, 1).text() if self.scenario_table.item(row, 1) else "").strip()
-            noise_file = (self.scenario_table.item(row, 2).text() if self.scenario_table.item(row, 2) else "").strip()
-            noise_gain = float((self.scenario_table.item(row, 3).text() if self.scenario_table.item(row, 3) else "0").strip() or 0)
-            wakeup_file = (self.scenario_table.item(row, 4).text() if self.scenario_table.item(row, 4) else "").strip()
-            wakeup_gain = float((self.scenario_table.item(row, 5).text() if self.scenario_table.item(row, 5) else "0").strip() or 0)
-            trials = int((self.scenario_table.item(row, 6).text() if self.scenario_table.item(row, 6) else "0").strip() or 0)
+            enabled = self.scenario_table.item(row, SCENARIO_COL_ENABLED).checkState() == QtCore.Qt.CheckState.Checked
+            name = (
+                self.scenario_table.item(row, SCENARIO_COL_NAME).text()
+                if self.scenario_table.item(row, SCENARIO_COL_NAME)
+                else ""
+            ).strip()
+            noise_file = (
+                self.scenario_table.item(row, SCENARIO_COL_NOISE_FILE).text()
+                if self.scenario_table.item(row, SCENARIO_COL_NOISE_FILE)
+                else ""
+            ).strip()
+            noise_gain = float(
+                (
+                    self.scenario_table.item(row, SCENARIO_COL_NOISE_GAIN).text()
+                    if self.scenario_table.item(row, SCENARIO_COL_NOISE_GAIN)
+                    else "0"
+                ).strip()
+                or 0
+            )
+            noise_playback_duration_ms = self._scenario_non_negative_int(row, SCENARIO_COL_NOISE_DURATION)
+            wakeup_file = (
+                self.scenario_table.item(row, SCENARIO_COL_WAKEUP_FILE).text()
+                if self.scenario_table.item(row, SCENARIO_COL_WAKEUP_FILE)
+                else ""
+            ).strip()
+            wakeup_gain = float(
+                (
+                    self.scenario_table.item(row, SCENARIO_COL_WAKEUP_GAIN).text()
+                    if self.scenario_table.item(row, SCENARIO_COL_WAKEUP_GAIN)
+                    else "0"
+                ).strip()
+                or 0
+            )
+            trials = self._scenario_non_negative_int(row, SCENARIO_COL_TRIALS)
             scenarios.append(
                 ScenarioConfig(
                     name=name or f"scene_{row + 1}",
                     noise_file=noise_file,
                     noise_gain_db=noise_gain,
+                    noise_playback_duration_ms=noise_playback_duration_ms,
                     wakeup_file=wakeup_file,
                     wakeup_gain_db=wakeup_gain,
                     trials=trials,
@@ -734,7 +901,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_scenario_row(scenario)
         if self.scenario_table.rowCount() > 0:
             self.scenario_table.selectRow(0)
-            self._sync_custom_trials_from_selected_row()
+            self._sync_custom_trials_from_selection()
+        else:
+            self._sync_custom_trials_from_selection()
         self._update_platform_visibility()
 
     def _load_config_from_file(self) -> None:
@@ -794,8 +963,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.scenario_table.rowCount() == 0:
             QtWidgets.QMessageBox.information(self, "试听", "请先添加一条场景。")
             return
-        file_column = 2 if preview_noise else 4
-        gain_column = 3 if preview_noise else 5
+        file_column = SCENARIO_COL_NOISE_FILE if preview_noise else SCENARIO_COL_WAKEUP_FILE
+        gain_column = SCENARIO_COL_NOISE_GAIN if preview_noise else SCENARIO_COL_WAKEUP_GAIN
         device = (
             self._selected_audio_device_value(self.noise_device_combo)
             if preview_noise
@@ -861,7 +1030,6 @@ class MainWindow(QtWidgets.QMainWindow):
         thread.started.connect(worker.run)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda: self._cleanup_worker(thread))
-        self.stop_requested.connect(worker.request_stop)
 
         self._task_thread = thread
         self._task_worker = worker
@@ -874,15 +1042,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._task_thread = None
             self._task_worker = None
             self._set_running_state(False)
-        try:
-            self.stop_requested.disconnect()
-        except Exception:
-            pass
+
+    def _request_current_worker_stop(self) -> None:
+        """直接调用当前 worker 的停止方法，避免排队信号延后生效。"""
+        if self._task_worker is not None:
+            self._task_worker.request_stop()
 
     def _stop_current_task(self) -> None:
         """向后台线程发送停止信号。"""
-        self.stop_requested.emit()
-        self.status_label.setText("停止请求已发送")
+        self._request_current_worker_stop()
+        self.status_label.setText("停止中，等待当前音频收尾")
 
     def _append_status(self, message: str) -> None:
         """在状态栏和日志框中追加状态文本。"""
@@ -927,7 +1096,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode == "run":
             summary = payload["summary"]
             self.run_dir_label.setText(summary.get("run_dir", "-"))
-            self.status_label.setText("测试完成")
+            if payload.get("stopped", False):
+                self.status_label.setText("测试已停止")
+                self.log_output.appendPlainText("[stopped] 用户手动停止")
+            else:
+                self.status_label.setText("测试完成")
             self.log_output.appendPlainText(f"[done] 报告输出目录: {summary.get('run_dir', '-')}")
             return
         if mode == "precheck":
@@ -935,8 +1108,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "预检通过", "\n".join(payload.get("messages", [])))
             return
         if mode == "preview":
-            self.status_label.setText("试听完成")
-            self.log_output.appendPlainText(f"[preview] 已完成试听: {payload.get('asset')}")
+            if payload.get("stopped", False):
+                self.status_label.setText("试听已停止")
+                self.log_output.appendPlainText(f"[preview] 已停止试听: {payload.get('asset')}")
+            else:
+                self.status_label.setText("试听完成")
+                self.log_output.appendPlainText(f"[preview] 已完成试听: {payload.get('asset')}")
 
     def _handle_worker_failed(self, message: str) -> None:
         """处理后台任务异常，并弹出错误对话框。"""
@@ -948,7 +1125,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """关闭窗口时尽量保存配置，并通知后台停止。"""
         self._persist_current_config()
         if self._task_worker is not None:
-            self.stop_requested.emit()
+            self._request_current_worker_stop()
         super().closeEvent(event)
 
 

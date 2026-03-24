@@ -43,6 +43,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.timing.success_window_ms, 3000)
             self.assertEqual(config.match_rules[0].pattern, "AudioHAL: Voice wake up triggered")
             self.assertEqual(config.scenarios[0].trials, 3)
+            self.assertEqual(config.scenarios[0].noise_playback_duration_ms, 0)
             self.assertEqual(Path(config.base_dir), path.parent)
 
     def test_load_config_migrates_legacy_qualcomm_success_rule(self) -> None:
@@ -77,6 +78,29 @@ class ConfigTests(unittest.TestCase):
                     "-----------------------------------------M33_WAKEUP_AR1 success!! ----------------------------------------------------------",
                 ],
             )
+
+    def test_load_config_supports_noise_playback_duration(self) -> None:
+        """场景级噪声播放时长应从 YAML 正确读入。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    platform: rtos
+                    scenarios:
+                      - name: office
+                        noise_file: office.wav
+                        noise_playback_duration_ms: 1800
+                        wakeup_file: wakeup.wav
+                        trials: 3
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertEqual(config.scenarios[0].noise_playback_duration_ms, 1800)
 
 
 if __name__ == "__main__":

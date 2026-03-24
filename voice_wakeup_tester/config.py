@@ -132,6 +132,7 @@ def _parse_scenarios(raw: Any) -> list[ScenarioConfig]:
                 name=str(item.get("name", "")).strip() or f"scenario_{len(scenarios) + 1}",
                 noise_file=str(item.get("noise_file", "")).strip(),
                 noise_gain_db=float(item.get("noise_gain_db", 0.0)),
+                noise_playback_duration_ms=max(int(item.get("noise_playback_duration_ms", 0)), 0),
                 wakeup_file=str(item.get("wakeup_file", "")).strip(),
                 wakeup_gain_db=float(item.get("wakeup_gain_db", 0.0)),
                 trials=int(item.get("trials", 10)),

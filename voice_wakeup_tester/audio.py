@@ -264,11 +264,16 @@ class PlaybackHandle:
         self._done.set()
         self._error = error
 
-    def wait(self, timeout: float | None = None) -> None:
+    def wait(self, timeout: float | None = None) -> bool:
         """等待播放完成，如播放线程报错则在此抛出。"""
-        self._done.wait(timeout=timeout)
-        if self._error:
+        finished = self._done.wait(timeout=timeout)
+        if finished and self._error:
             raise self._error
+        return finished
+
+    def stop(self) -> None:
+        """单次播放句柄默认无需显式停止。"""
+        return None
 
 
 class NoiseLoopHandle:
@@ -304,6 +309,7 @@ class _SoundDevicePlaybackHandle(PlaybackHandle):
         self._backend = _require_sounddevice()
         self._device_index = device_index
         self._asset = asset
+        self._stop_requested = threading.Event()
         self._done = threading.Event()
         self._started = threading.Event()
         self._error: Exception | None = None
@@ -322,6 +328,8 @@ class _SoundDevicePlaybackHandle(PlaybackHandle):
         def callback(outdata, frames, _time_info, _status):
             nonlocal position
             outdata.fill(0)
+            if self._stop_requested.is_set():
+                raise self._backend.CallbackStop()
             end = min(position + frames, len(self._asset.samples))
             chunk = self._asset.samples[position:end]
             if len(chunk):
@@ -348,6 +356,14 @@ class _SoundDevicePlaybackHandle(PlaybackHandle):
             self._started.set()
         finally:
             self._done.set()
+
+    def stop(self) -> None:
+        """请求单次播放尽快停止。"""
+        if self._done.is_set():
+            if self._error:
+                raise self._error
+            return
+        self._stop_requested.set()
 
 
 class _SoundDeviceNoiseLoopHandle(NoiseLoopHandle):
@@ -410,10 +426,11 @@ class _SoundDeviceNoiseLoopHandle(NoiseLoopHandle):
 
     def stop(self) -> None:
         """请求循环噪声停止。"""
+        if self._done.is_set():
+            if self._error:
+                raise self._error
+            return
         self._stop_requested.set()
-        self._done.wait(timeout=3.0)
-        if self._error:
-            raise self._error
 
 
 class SoundDeviceAudioBackend:

@@ -19,6 +19,7 @@ scenarios:
   - name: office_55db
     noise_file: 'C:\audio\office.wav'
     noise_gain_db: -3.0
+    noise_playback_duration_ms: 3000
     wakeup_file: 'C:\audio\wakeup.wav'
     wakeup_gain_db: 0.0
     trials: 20
@@ -26,6 +27,7 @@ scenarios:
   - name: subway_65db
     noise_file: 'C:\audio\subway.wav'
     noise_gain_db: 0.0
+    noise_playback_duration_ms: 0
     wakeup_file: 'C:\audio\wakeup.wav'
     wakeup_gain_db: 0.0
     trials: 20

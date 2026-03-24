@@ -13,6 +13,8 @@ import yaml
 from .audio import (
     AudioAsset,
     AudioValidationError,
+    NoiseLoopHandle,
+    PlaybackHandle,
     classify_output_device_name,
     create_audio_backend,
     load_wav_asset,
@@ -110,6 +112,8 @@ class TestEngine:
         self._events: list[LogEvent] = []
         self._trial_results: list[TrialResult] = []
         self._active_trial: ActiveTrialWindow | None = None
+        self._active_noise_handle: NoiseLoopHandle | None = None
+        self._active_playback_handle: PlaybackHandle | None = None
         self._active_lock = threading.Lock()
         self._fatal_error: Exception | None = None
         self._stop_requested = threading.Event()
@@ -196,22 +200,79 @@ class TestEngine:
             if self._active_trial is not None:
                 self._active_trial.match_event.set()
 
+    def _register_active_noise_handle(self, handle: NoiseLoopHandle | None) -> None:
+        """记录当前场景正在播放的噪声句柄。"""
+        with self._active_lock:
+            self._active_noise_handle = handle
+
+    def _clear_active_noise_handle(self, handle: NoiseLoopHandle | None = None) -> None:
+        """按需清理当前活动噪声句柄引用。"""
+        with self._active_lock:
+            if handle is None or self._active_noise_handle is handle:
+                self._active_noise_handle = None
+
+    def _register_active_playback_handle(self, handle: PlaybackHandle | None) -> None:
+        """记录当前正在播放的单次音频句柄。"""
+        with self._active_lock:
+            self._active_playback_handle = handle
+
+    def _clear_active_playback_handle(self, handle: PlaybackHandle | None = None) -> None:
+        """按需清理当前活动单次播放句柄引用。"""
+        with self._active_lock:
+            if handle is None or self._active_playback_handle is handle:
+                self._active_playback_handle = None
+
+    def _wait_for_playback_completion(self, handle: PlaybackHandle, timeout: float) -> bool:
+        """等待单次播放结束，并在收到停止请求时立即停声。"""
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            remaining = deadline - time.monotonic()
+            if handle.wait(timeout=min(0.05, max(remaining, 0.0))):
+                return self._stop_requested.is_set()
+            if self._stop_requested.is_set():
+                handle.stop()
+                handle.wait(timeout=3.0)
+                return True
+            if remaining <= 0:
+                return False
+
+    def _stop_active_audio(self) -> None:
+        """停止当前仍处于活动状态的音频句柄。"""
+        with self._active_lock:
+            active_trial = self._active_trial
+            playback_handle = self._active_playback_handle
+            noise_handle = self._active_noise_handle
+        if active_trial is not None:
+            active_trial.match_event.set()
+        for handle in (playback_handle, noise_handle):
+            if handle is None:
+                continue
+            try:
+                handle.stop()
+            except Exception:
+                pass
+
     def request_stop(self) -> None:
         """供 GUI/CLI 主动请求停止测试。"""
         self._stop_requested.set()
+        self._stop_active_audio()
         if self._log_source is not None:
             try:
                 self._log_source.stop()
             except Exception:
                 pass
 
-    def preview_asset(self, path: str, device: str, gain_db: float = 0.0) -> None:
+    def preview_asset(self, path: str, device: str, gain_db: float = 0.0) -> bool:
         """用于 GUI 试听按钮的单次播放。"""
         asset = self._load_asset(path, gain_db, scenario_name="preview", asset_label="试听")
         if not self.dry_run:
             self.audio_backend.validate_output(device, asset)
         handle = self.audio_backend.play_once(device, asset)
-        handle.wait(timeout=max(asset.duration_seconds + 5.0, 5.0))
+        self._register_active_playback_handle(handle)
+        try:
+            return self._wait_for_playback_completion(handle, timeout=max(asset.duration_seconds + 5.0, 5.0))
+        finally:
+            self._clear_active_playback_handle(handle)
 
     def _enabled_scenarios(self):
         """返回启用状态的场景列表。"""
@@ -276,6 +337,12 @@ class TestEngine:
             messages.append(self._describe_match_rule(rule, index))
         return messages
 
+    def _describe_noise_playback_duration(self, duration_ms: int) -> str:
+        """Render a per-scenario noise playback duration for status output."""
+        if duration_ms <= 0:
+            return "整场景（默认）"
+        return f"{duration_ms} ms"
+
     def _build_config_snapshot_messages(self) -> list[str]:
         """Build a full precheck snapshot of the active configuration."""
         snapshot = yaml.safe_dump(self.config.to_dict(), sort_keys=False, allow_unicode=True).strip()
@@ -316,6 +383,10 @@ class TestEngine:
                 f"唤醒词 {wake_asset.sample_rate}Hz/{wake_asset.channels}ch"
             )
         # 这里单独实例化一次日志源，只做可用性探测，不进入正式 run。
+        for scenario in enabled:
+            messages.append(
+                f"场景 {scenario.name}: 噪声播放时长 {self._describe_noise_playback_duration(scenario.noise_playback_duration_ms)}"
+            )
         log_source = self.log_source_factory(
             platform=self.config.platform,
             serial_port=self.config.dut.serial_port,
@@ -410,13 +481,21 @@ class TestEngine:
             trial.latency_ms = late_latency_ms
             trial.failure_reason = LATE_MATCH_OUTSIDE_WINDOW_REASON.format(latency_ms=late_latency_ms)
 
-    def _sleep_interruptible(self, seconds: float) -> bool:
+    def _sleep_interruptible(
+        self,
+        seconds: float,
+        tick_callback: Callable[[], None] | None = None,
+    ) -> bool:
         """可中断睡眠，用于试次间隔与预热等待。"""
         deadline = time.monotonic() + max(seconds, 0.0)
         while time.monotonic() < deadline:
             if self._stop_requested.is_set() or self._fatal_error is not None:
                 return False
+            if tick_callback is not None:
+                tick_callback()
             time.sleep(min(0.1, deadline - time.monotonic()))
+        if tick_callback is not None:
+            tick_callback()
         return True
 
     def _build_partial_summary(self) -> dict:
@@ -468,6 +547,8 @@ class TestEngine:
         self._fatal_error = None
         self._stop_requested.clear()
         self._active_trial = None
+        self._active_noise_handle = None
+        self._active_playback_handle = None
 
         for message in self.precheck():
             callbacks.status(message)
@@ -512,6 +593,37 @@ class TestEngine:
                         self.config.audio_devices.noise_output,
                         noise_asset,
                     )
+                    self._register_active_noise_handle(noise_handle)
+                    noise_started_monotonic = time.monotonic()
+                    noise_stop_deadline = (
+                        None
+                        if scenario.noise_playback_duration_ms <= 0
+                        else noise_started_monotonic + scenario.noise_playback_duration_ms / 1000.0
+                    )
+                    noise_stopped = False
+
+                    def stop_noise(*, announce_timeout: bool = False, quiet: bool = False) -> None:
+                        nonlocal noise_stopped
+                        if noise_stopped:
+                            return
+                        try:
+                            noise_handle.stop()
+                            if announce_timeout:
+                                callbacks.status(
+                                    f"场景 {scenario.name}: 噪声已按自定义时长 {scenario.noise_playback_duration_ms} ms 停止，后续试次继续执行"
+                                )
+                        except Exception as exc:
+                            if not quiet:
+                                callbacks.status(f"鍋滄鍣０鎾斁澶辫触: {exc}")
+                        finally:
+                            self._clear_active_noise_handle(noise_handle)
+                            noise_stopped = True
+
+                    def stop_noise_if_due() -> None:
+                        if noise_stopped or noise_stop_deadline is None:
+                            return
+                        if time.monotonic() >= noise_stop_deadline:
+                            stop_noise(announce_timeout=True)
                 except Exception as exc:
                     result = TrialResult(
                         platform=self.config.normalized_platform(),
@@ -530,12 +642,16 @@ class TestEngine:
                     abort_cursor = (scenario_index, 2, f"噪声播放异常: {exc}")
                     break
                 try:
-                    if not self._sleep_interruptible(self.config.timing.pre_noise_roll_ms / 1000.0):
+                    if not self._sleep_interruptible(
+                        self.config.timing.pre_noise_roll_ms / 1000.0,
+                        tick_callback=stop_noise_if_due,
+                    ):
                         reason = "测试在噪声预热阶段被中断"
                         abort_cursor = (scenario_index, 1, reason)
                         break
 
                     for trial_index in range(1, scenario.trials + 1):
+                        stop_noise_if_due()
                         if self._fatal_error is not None:
                             reason = f"日志监听异常: {self._fatal_error}"
                             abort_cursor = (scenario_index, trial_index, reason)
@@ -576,6 +692,7 @@ class TestEngine:
                             )
                             abort_cursor = (scenario_index, trial_index + 1, f"唤醒词播放异常: {exc}")
                             break
+                        self._register_active_playback_handle(playback_handle)
                         start_monotonic = playback_handle.started_at_monotonic
                         deadline = start_monotonic + self.config.timing.success_window_ms / 1000.0
                         active = ActiveTrialWindow(
@@ -598,6 +715,7 @@ class TestEngine:
                             # 等待直到命中、超时、用户停止或底层日志链路出错。
                             if active.match_event.wait(timeout=0.05):
                                 break
+                            stop_noise_if_due()
                             if self._fatal_error is not None or self._stop_requested.is_set():
                                 break
                             if time.monotonic() >= deadline:
@@ -605,12 +723,16 @@ class TestEngine:
 
                         playback_error: Exception | None = None
                         try:
-                            playback_handle.wait(timeout=max(wake_asset.duration_seconds + 5.0, 5.0))
+                            self._wait_for_playback_completion(
+                                playback_handle,
+                                timeout=max(wake_asset.duration_seconds + 5.0, 5.0),
+                            )
                         except Exception as exc:
                             playback_error = exc
                         with self._active_lock:
                             matched_event = active.matched_log_event
                             self._active_trial = None
+                        self._clear_active_playback_handle(playback_handle)
 
                         if playback_error is not None:
                             status = TRIAL_STATUS_ERROR
@@ -679,14 +801,17 @@ class TestEngine:
                         # 试次间隔按“本轮播放开始时刻”对齐，而不是按上一轮结束时刻累加。
                         elapsed_since_start = time.monotonic() - start_monotonic
                         remaining_interval = (self.config.timing.trial_interval_ms / 1000.0) - elapsed_since_start
-                        if remaining_interval > 0 and not self._sleep_interruptible(remaining_interval):
+                        if remaining_interval > 0 and not self._sleep_interruptible(
+                            remaining_interval,
+                            tick_callback=stop_noise_if_due,
+                        ):
                             abort_cursor = (scenario_index, trial_index + 1, "测试在试次间隔阶段被中断")
                             break
                     if abort_cursor is not None:
                         break
                 finally:
                     try:
-                        noise_handle.stop()
+                        stop_noise(quiet=True)
                     except Exception as exc:
                         callbacks.status(f"停止噪声播放失败: {exc}")
 

@@ -77,6 +77,7 @@ class ScenarioConfig:
     name: str
     noise_file: str
     noise_gain_db: float = 0.0
+    noise_playback_duration_ms: int = 0
     wakeup_file: str = ""
     wakeup_gain_db: float = 0.0
     trials: int = 10
@@ -88,6 +89,7 @@ class ScenarioConfig:
             "name": self.name,
             "noise_file": self.noise_file,
             "noise_gain_db": self.noise_gain_db,
+            "noise_playback_duration_ms": self.noise_playback_duration_ms,
             "wakeup_file": self.wakeup_file,
             "wakeup_gain_db": self.wakeup_gain_db,
             "trials": self.trials,
