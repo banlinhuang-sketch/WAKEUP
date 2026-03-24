@@ -23,6 +23,14 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+## GitHub Actions Build
+
+The repository includes [`.github/workflows/build-windows-exe.yml`](.github/workflows/build-windows-exe.yml) for automatic Windows packaging.
+
+- Push to `main`, open a pull request, or run `workflow_dispatch`: run tests and build the EXE, then upload a GitHub Actions artifact.
+- Push a tag like `v1.0.0`: build the EXE and also upload `voice_wakeup_tester-windows-x64.zip` to the GitHub Release.
+- The packaged file keeps the full `dist/voice_wakeup_tester` directory so the EXE and its `_internal` dependencies stay together.
+
 ## Headless Mode
 
 ```powershell

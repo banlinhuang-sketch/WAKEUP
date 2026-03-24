@@ -1,0 +1,78 @@
+name: Build Windows EXE
+
+"on":
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Compile sources
+        run: python -m compileall main.py voice_wakeup_tester tests
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm voice_wakeup_tester.spec
+
+      - name: Package EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          $zipPath = "release/voice_wakeup_tester-windows-x64.zip"
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+          Compress-Archive -Path dist/voice_wakeup_tester -DestinationPath $zipPath
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice_wakeup_tester-windows-x64
+          path: release/voice_wakeup_tester-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release asset for tags
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag release/voice_wakeup_tester-windows-x64.zip --clobber
+          } else {
+            gh release create $tag release/voice_wakeup_tester-windows-x64.zip --title $tag --notes "Automated Windows build for voice_wakeup_tester."
+          }
