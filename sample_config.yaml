@@ -13,6 +13,9 @@ timing:
   pre_noise_roll_ms: 2000
   trial_interval_ms: 5000
   success_window_ms: 3000
+recording_guard:
+  enabled: false
+  settle_ms: 1000
 allow_same_device: false
 output_root: ""
 scenarios:

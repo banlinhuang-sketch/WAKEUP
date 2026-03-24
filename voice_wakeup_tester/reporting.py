@@ -38,11 +38,17 @@ def _scenario_summary(trials: list[TrialResult]) -> dict[str, Any]:
     attempted = [trial for trial in trials if trial.status != TRIAL_STATUS_SKIPPED]
     passed = [trial for trial in attempted if trial.status == TRIAL_STATUS_PASS]
     latencies = [trial.latency_ms for trial in passed if trial.latency_ms is not None]
+    recording_guard_triggered = [trial for trial in trials if trial.recording_guard_triggered]
+    recording_guard_recovered = [
+        trial for trial in recording_guard_triggered if trial.recording_guard_recovery_result == "RECOVERED"
+    ]
     return {
         "total_trials": len(trials),
         "attempted_trials": len(attempted),
         "passed_trials": len(passed),
         "failed_trials": len([trial for trial in attempted if trial.status not in {TRIAL_STATUS_PASS}]),
+        "recording_guard_triggered": len(recording_guard_triggered),
+        "recording_guard_recovered": len(recording_guard_recovered),
         "success_rate": round((len(passed) / len(attempted) * 100.0), 3) if attempted else 0.0,
         "latency_ms": {
             "avg": round(statistics.fmean(latencies), 3) if latencies else None,
@@ -104,6 +110,10 @@ def write_reports(
                 "latency_ms",
                 "matched_line",
                 "failure_reason",
+                "recording_guard_triggered",
+                "recording_guard_state",
+                "recording_guard_recovery_action",
+                "recording_guard_recovery_result",
             ],
         )
         writer.writeheader()

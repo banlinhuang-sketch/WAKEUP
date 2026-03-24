@@ -23,8 +23,10 @@ except ImportError as exc:  # pragma: no cover - depends on CI/runtime Qt availa
 from voice_wakeup_tester.config import config_from_dict
 from voice_wakeup_tester.gui import (
     MainWindow,
+    SCENARIO_COL_NOISE_GAIN,
     SCENARIO_COL_NOISE_DURATION,
     SCENARIO_COL_TRIALS,
+    SCENARIO_COL_WAKEUP_GAIN,
 )
 from voice_wakeup_tester.models import ScenarioConfig
 
@@ -164,6 +166,114 @@ class CustomTrialsGuiTests(unittest.TestCase):
         message_box.assert_called_once()
         self.assertIn("请先选中至少一条场景。", message_box.call_args.args[2])
 
+    def test_volume_details_show_single_selected_scenario_values(self) -> None:
+        """单选场景时应显示该场景的具体噪声和唤醒词音量。"""
+        window = self._create_window(
+            [
+                {
+                    "name": "scene_1",
+                    "noise_file": "",
+                    "noise_gain_db": -3.0,
+                    "wakeup_file": "",
+                    "wakeup_gain_db": 2.5,
+                    "trials": 4,
+                    "enabled": True,
+                }
+            ]
+        )
+
+        self._select_rows(window, [0])
+
+        self.assertEqual(window.volume_details_scope_label.text(), "当前场景：scene_1")
+        self.assertEqual(window.noise_volume_details_label.text(), "-3.0 dB (0.708x)")
+        self.assertEqual(window.wakeup_volume_details_label.text(), "2.5 dB (1.334x)")
+
+    def test_volume_details_show_same_value_for_multi_select(self) -> None:
+        """多选且增益一致时，音量详情应显示共享的具体数值。"""
+        window = self._create_window(
+            [
+                {
+                    "name": "scene_1",
+                    "noise_file": "",
+                    "noise_gain_db": 1.0,
+                    "wakeup_file": "",
+                    "wakeup_gain_db": -2.0,
+                    "trials": 4,
+                    "enabled": True,
+                },
+                {
+                    "name": "scene_2",
+                    "noise_file": "",
+                    "noise_gain_db": 1.0,
+                    "wakeup_file": "",
+                    "wakeup_gain_db": -2.0,
+                    "trials": 6,
+                    "enabled": True,
+                },
+            ]
+        )
+
+        self._select_rows(window, [0, 1])
+
+        self.assertEqual(window.volume_details_scope_label.text(), "已选 2 条场景")
+        self.assertEqual(window.noise_volume_details_label.text(), "1.0 dB (1.122x)")
+        self.assertEqual(window.wakeup_volume_details_label.text(), "-2.0 dB (0.794x)")
+
+    def test_volume_details_show_mixed_value_hint_for_multi_select(self) -> None:
+        """多选且增益不一致时，应显示混合值提示而不是误导性的单值。"""
+        window = self._create_window(
+            [
+                {
+                    "name": "scene_1",
+                    "noise_file": "",
+                    "noise_gain_db": 0.0,
+                    "wakeup_file": "",
+                    "wakeup_gain_db": -1.0,
+                    "trials": 4,
+                    "enabled": True,
+                },
+                {
+                    "name": "scene_2",
+                    "noise_file": "",
+                    "noise_gain_db": -6.0,
+                    "wakeup_file": "",
+                    "wakeup_gain_db": -1.0,
+                    "trials": 6,
+                    "enabled": True,
+                },
+            ]
+        )
+
+        self._select_rows(window, [0, 1])
+
+        self.assertEqual(window.volume_details_scope_label.text(), "已选 2 条场景")
+        self.assertEqual(window.noise_volume_details_label.text(), "混合值")
+        self.assertEqual(window.wakeup_volume_details_label.text(), "-1.0 dB (0.891x)")
+
+    def test_volume_details_refresh_after_gain_edit(self) -> None:
+        """编辑增益列后，音量详情应立即刷新。"""
+        window = self._create_window(
+            [
+                {
+                    "name": "scene_1",
+                    "noise_file": "",
+                    "noise_gain_db": 0.0,
+                    "wakeup_file": "",
+                    "wakeup_gain_db": 0.0,
+                    "trials": 4,
+                    "enabled": True,
+                }
+            ]
+        )
+
+        self._select_rows(window, [0])
+        window.scenario_table.item(0, SCENARIO_COL_NOISE_GAIN).setText("-6.0")
+        window.scenario_table.item(0, SCENARIO_COL_WAKEUP_GAIN).setText("3.0")
+        QtWidgets.QApplication.processEvents()
+
+        self.assertEqual(window.noise_volume_details_label.text(), "-6.0 dB (0.501x)")
+        self.assertEqual(window.wakeup_volume_details_label.text(), "3.0 dB (1.413x)")
+
     def test_new_scenario_inherits_current_custom_trials_value(self) -> None:
         """新增场景应继续沿用当前自定义次数输入值。"""
         window = self._create_window([])
@@ -195,6 +305,61 @@ class CustomTrialsGuiTests(unittest.TestCase):
         config = window._config_from_ui()
 
         self.assertEqual(config.scenarios[0].noise_playback_duration_ms, 2300)
+
+    def test_recording_guard_round_trips_through_ui(self) -> None:
+        """Qualcomm 录像态守护开关和等待时间应能正确回写配置。"""
+        config = config_from_dict(
+            {
+                "platform": "qualcomm",
+                "dut": {"adb_serial": "ABC123"},
+                "recording_guard": {"enabled": True, "settle_ms": 1800},
+                "audio_devices": {"mouth_output": "", "noise_output": ""},
+                "scenarios": [
+                    {
+                        "name": "scene_1",
+                        "noise_file": "",
+                        "wakeup_file": "",
+                        "trials": 4,
+                        "enabled": True,
+                    }
+                ],
+            },
+            base_dir=self.project_root,
+        )
+        patcher = mock.patch.object(MainWindow, "_refresh_device_lists", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        window = MainWindow(project_root=self.project_root, initial_config=config, dry_run=True)
+        self.addCleanup(window.close)
+
+        self.assertTrue(window.recording_guard_checkbox.isChecked())
+        self.assertEqual(window.recording_guard_settle_spin.value(), 1800)
+
+        window.recording_guard_checkbox.setChecked(False)
+        window.recording_guard_settle_spin.setValue(900)
+
+        updated = window._config_from_ui()
+
+        self.assertFalse(updated.recording_guard.enabled)
+        self.assertEqual(updated.recording_guard.settle_ms, 900)
+
+    def test_recording_guard_controls_follow_platform_visibility(self) -> None:
+        """录像态守护控件应只在 Qualcomm 平台下可编辑。"""
+        window = self._create_window(
+            [
+                {"name": "scene_1", "noise_file": "", "wakeup_file": "", "trials": 4, "enabled": True},
+            ]
+        )
+
+        window.platform_combo.setCurrentText("rtos")
+        QtWidgets.QApplication.processEvents()
+        self.assertFalse(window.recording_guard_checkbox.isEnabled())
+        self.assertFalse(window.recording_guard_settle_spin.isEnabled())
+
+        window.platform_combo.setCurrentText("qualcomm")
+        QtWidgets.QApplication.processEvents()
+        self.assertTrue(window.recording_guard_checkbox.isEnabled())
+        self.assertTrue(window.recording_guard_settle_spin.isEnabled())
 
     def test_stop_current_task_calls_worker_immediately_and_updates_status(self) -> None:
         """点击停止应直接调用当前 worker 的停止方法，并显示停止中文案。"""

@@ -7,7 +7,9 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from voice_wakeup_tester.config import load_config
+import yaml
+
+from voice_wakeup_tester.config import config_from_dict, load_config, save_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -101,6 +103,62 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
 
             self.assertEqual(config.scenarios[0].noise_playback_duration_ms, 1800)
+
+    def test_load_config_supports_recording_guard(self) -> None:
+        """Qualcomm 录像态守护配置应从 YAML 正确读入。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    platform: qualcomm
+                    dut:
+                      adb_serial: ABC123
+                    recording_guard:
+                      enabled: true
+                      settle_ms: 1500
+                    scenarios:
+                      - name: office
+                        noise_file: office.wav
+                        wakeup_file: wakeup.wav
+                        trials: 3
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertTrue(config.recording_guard.enabled)
+            self.assertEqual(config.recording_guard.settle_ms, 1500)
+
+    def test_save_config_persists_recording_guard(self) -> None:
+        """录像态守护配置应能稳定回写到 YAML 快照。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.yaml"
+            config = config_from_dict(
+                {
+                    "platform": "qualcomm",
+                    "dut": {"adb_serial": "ABC123"},
+                    "recording_guard": {"enabled": True, "settle_ms": 1800},
+                    "scenarios": [
+                        {
+                            "name": "office",
+                            "noise_file": "office.wav",
+                            "wakeup_file": "wakeup.wav",
+                            "trials": 3,
+                        }
+                    ],
+                },
+                base_dir=temp_dir,
+            )
+
+            save_config(path, config)
+
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["recording_guard"]["enabled"], True)
+            self.assertEqual(payload["recording_guard"]["settle_ms"], 1800)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from voice_wakeup_tester.dut import SyntheticLogSource
 from voice_wakeup_tester.engine import EngineCallbacks, TestEngine
 from voice_wakeup_tester.models import (
     LogEvent,
+    TRIAL_STATUS_ERROR,
     TRIAL_STATUS_FAIL,
     TRIAL_STATUS_PASS,
     TRIAL_STATUS_SKIPPED,
@@ -148,6 +149,43 @@ class RecordingAudioBackend:
 
     def play_once(self, _selection, _asset) -> RecordingPlaybackHandle:
         return RecordingPlaybackHandle()
+
+
+class FakeRecordingGuardController:
+    """Test double for Qualcomm recording-state recovery."""
+
+    def __init__(
+        self,
+        property_value: str | list[str] = "OFF",
+        *,
+        property_error: Exception | None = None,
+        back_error: Exception | None = None,
+    ):
+        self.property_value = property_value
+        self.property_error = property_error
+        self.back_error = back_error
+        self.precheck_calls = 0
+        self.property_calls = 0
+        self.back_calls = 0
+
+    def precheck(self) -> None:
+        self.precheck_calls += 1
+
+    def get_property(self, name: str) -> str:
+        self.property_calls += 1
+        if self.property_error is not None:
+            raise self.property_error
+        if name != "emdoor.video.state":
+            raise AssertionError(name)
+        if isinstance(self.property_value, list):
+            index = min(self.property_calls - 1, len(self.property_value) - 1)
+            return self.property_value[index]
+        return self.property_value
+
+    def send_back(self) -> None:
+        self.back_calls += 1
+        if self.back_error is not None:
+            raise self.back_error
 
 
 class EngineTests(unittest.TestCase):
@@ -312,6 +350,51 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(any("success_window_ms: 5000" in message for message in messages))
             self.assertTrue(any("trials: 5" in message for message in messages))
 
+    def test_precheck_reports_recording_guard_configuration(self) -> None:
+        """Precheck should show the Qualcomm recording guard status and action details."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "qualcomm",
+                    "dut": {"adb_serial": "ABC123"},
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "recording_guard": {"enabled": True, "settle_ms": 1500},
+                    "scenarios": [
+                        {
+                            "name": "scene_2",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 1,
+                        }
+                    ],
+                }
+            )
+            controller = FakeRecordingGuardController()
+
+            class StubLogSource:
+                def precheck(self) -> None:
+                    return None
+
+            engine = TestEngine(
+                config=config,
+                dry_run=True,
+                log_source_factory=lambda **_kwargs: StubLogSource(),
+                adb_controller_factory=lambda **_kwargs: controller,
+            )
+            messages = engine.precheck()
+
+            self.assertTrue(any("录像态守护: 启用" in message for message in messages))
+            self.assertTrue(any("emdoor.video.state" in message for message in messages))
+            self.assertTrue(any("ADB BACK" in message for message in messages))
+            self.assertTrue(any("1500 ms" in message for message in messages))
+            self.assertEqual(controller.precheck_calls, 1)
+
     def test_precheck_reports_noise_playback_duration_for_each_scenario(self) -> None:
         """Precheck should show whether a scenario uses full-scene noise or a custom duration."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -352,6 +435,42 @@ class EngineTests(unittest.TestCase):
 
             self.assertTrue(any("full_scene" in message and "整场景" in message for message in messages))
             self.assertTrue(any("timed_scene" in message and "1800 ms" in message for message in messages))
+
+    def test_precheck_reports_effective_volume_values_for_each_scenario(self) -> None:
+        """Precheck should show the exact effective gain details for enabled scenarios."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "rtos",
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "scenarios": [
+                        {
+                            "name": "volume_scene",
+                            "noise_file": str(noise),
+                            "noise_gain_db": -3.0,
+                            "wakeup_file": str(wakeup),
+                            "wakeup_gain_db": 2.5,
+                            "trials": 1,
+                        }
+                    ],
+                }
+            )
+
+            class StubLogSource:
+                def precheck(self) -> None:
+                    return None
+
+            engine = TestEngine(config=config, dry_run=True, log_source_factory=lambda **_kwargs: StubLogSource())
+            messages = engine.precheck()
+
+            self.assertTrue(any("volume_scene" in message and "-3.0 dB (0.708x)" in message for message in messages))
+            self.assertTrue(any("volume_scene" in message and "2.5 dB (1.334x)" in message for message in messages))
 
     def test_custom_noise_duration_stops_noise_and_keeps_remaining_trials_running(self) -> None:
         """Custom noise duration should stop the noise loop without interrupting later trials."""
@@ -435,6 +554,196 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(summary["overall"]["total_trials"], 2)
             self.assertEqual(backend.noise_handles[0].stop_calls, 1)
             self.assertFalse(any("噪声已按自定义时长" in message for message in statuses))
+
+    def test_recording_guard_off_keeps_normal_trial_result(self) -> None:
+        """录像态为 OFF 时，本轮应继续按原 PASS/FAIL 逻辑结算。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "qualcomm",
+                    "dut": {"adb_serial": "ABC123"},
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "recording_guard": {"enabled": True, "settle_ms": 10},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 20,
+                        "success_window_ms": 200,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "scene_2",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 1,
+                        }
+                    ],
+                }
+            )
+            controller = FakeRecordingGuardController(property_value="OFF")
+            engine = TestEngine(
+                config=config,
+                dry_run=True,
+                adb_controller_factory=lambda **_kwargs: controller,
+            )
+
+            summary = engine.run()
+
+            self.assertEqual(summary["overall"]["passed_trials"], 1)
+            self.assertEqual(engine.trial_results[0].status, TRIAL_STATUS_PASS)
+            self.assertEqual(engine.trial_results[0].recording_guard_state, "OFF")
+            self.assertFalse(engine.trial_results[0].recording_guard_triggered)
+            self.assertEqual(controller.back_calls, 0)
+            self.assertTrue(any(event.raw_line == "recording_state=OFF" for event in engine.events))
+
+    def test_recording_guard_on_skips_current_trial_and_continues(self) -> None:
+        """录像态为 ON 时，本轮应执行 BACK、记为 SKIPPED，并继续后续试次。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "qualcomm",
+                    "dut": {"adb_serial": "ABC123"},
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "recording_guard": {"enabled": True, "settle_ms": 10},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 20,
+                        "success_window_ms": 200,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "scene_2",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 2,
+                        }
+                    ],
+                }
+            )
+            controller = FakeRecordingGuardController(property_value=["ON", "OFF"])
+            engine = TestEngine(
+                config=config,
+                dry_run=True,
+                adb_controller_factory=lambda **_kwargs: controller,
+            )
+
+            summary = engine.run()
+
+            self.assertEqual([result.status for result in engine.trial_results], [TRIAL_STATUS_SKIPPED, TRIAL_STATUS_PASS])
+            self.assertEqual(engine.trial_results[0].failure_reason, "检测到录像态，已执行 BACK 并跳过本轮")
+            self.assertTrue(engine.trial_results[0].recording_guard_triggered)
+            self.assertEqual(engine.trial_results[0].recording_guard_state, "ON")
+            self.assertEqual(engine.trial_results[0].recording_guard_recovery_action, "BACK")
+            self.assertEqual(engine.trial_results[0].recording_guard_recovery_result, "RECOVERED")
+            self.assertEqual(controller.back_calls, 1)
+            self.assertEqual(summary["overall"]["recording_guard_triggered"], 1)
+            self.assertEqual(summary["overall"]["recording_guard_recovered"], 1)
+            self.assertTrue(any(event.raw_line == "recording_recovery_action=BACK" for event in engine.events))
+
+    def test_recording_guard_query_failure_aborts_remaining_trials(self) -> None:
+        """录像态查询失败时，当前轮应记为 ERROR，当前场景剩余轮次应被跳过。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "qualcomm",
+                    "dut": {"adb_serial": "ABC123"},
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "recording_guard": {"enabled": True, "settle_ms": 10},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 20,
+                        "success_window_ms": 200,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "scene_2",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 3,
+                        }
+                    ],
+                }
+            )
+            controller = FakeRecordingGuardController(property_error=RuntimeError("adb shell getprop failed"))
+            engine = TestEngine(
+                config=config,
+                dry_run=True,
+                adb_controller_factory=lambda **_kwargs: controller,
+            )
+
+            summary = engine.run()
+
+            self.assertEqual(engine.trial_results[0].status, TRIAL_STATUS_ERROR)
+            self.assertIn("录像态查询失败", engine.trial_results[0].failure_reason)
+            self.assertTrue(all(result.status == TRIAL_STATUS_SKIPPED for result in engine.trial_results[1:]))
+            self.assertEqual(summary.get("fatal_error"), None)
+
+    def test_recording_guard_back_failure_aborts_remaining_trials(self) -> None:
+        """录像态退出失败时，当前轮应记为 ERROR，当前场景剩余轮次应被跳过。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            wakeup = temp_path / "wakeup.wav"
+            noise = temp_path / "noise.wav"
+            write_silence_wav(wakeup)
+            write_silence_wav(noise)
+
+            config = config_from_dict(
+                {
+                    "platform": "qualcomm",
+                    "dut": {"adb_serial": "ABC123"},
+                    "audio_devices": {"mouth_output": "", "noise_output": ""},
+                    "recording_guard": {"enabled": True, "settle_ms": 10},
+                    "timing": {
+                        "pre_noise_roll_ms": 0,
+                        "trial_interval_ms": 20,
+                        "success_window_ms": 200,
+                    },
+                    "output_root": str(temp_path / "out"),
+                    "scenarios": [
+                        {
+                            "name": "scene_2",
+                            "noise_file": str(noise),
+                            "wakeup_file": str(wakeup),
+                            "trials": 3,
+                        }
+                    ],
+                }
+            )
+            controller = FakeRecordingGuardController(property_value="ON", back_error=RuntimeError("adb back failed"))
+            engine = TestEngine(
+                config=config,
+                dry_run=True,
+                adb_controller_factory=lambda **_kwargs: controller,
+            )
+
+            summary = engine.run()
+
+            self.assertEqual(engine.trial_results[0].status, TRIAL_STATUS_ERROR)
+            self.assertIn("录像态退出失败", engine.trial_results[0].failure_reason)
+            self.assertTrue(engine.trial_results[0].recording_guard_triggered)
+            self.assertEqual(engine.trial_results[0].recording_guard_recovery_result, "FAILED")
+            self.assertTrue(all(result.status == TRIAL_STATUS_SKIPPED for result in engine.trial_results[1:]))
+            self.assertEqual(summary["overall"]["recording_guard_triggered"], 1)
 
     def test_annotate_late_matches_for_reports_marks_late_hit(self) -> None:
         """Late matches should be attached to the failed trial for reporting."""

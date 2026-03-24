@@ -13,6 +13,7 @@ import yaml
 from .audio import (
     AudioAsset,
     AudioValidationError,
+    format_gain_details,
     NoiseLoopHandle,
     PlaybackHandle,
     classify_output_device_name,
@@ -20,7 +21,7 @@ from .audio import (
     load_wav_asset,
     resolve_output_device,
 )
-from .dut import SyntheticLogSource, create_log_source
+from .dut import SyntheticLogSource, create_adb_controller, create_log_source
 from .matching import match_any
 from .models import (
     AppConfig,
@@ -43,6 +44,9 @@ NO_MATCH_IN_WINDOW_REASON = (
 LATE_MATCH_OUTSIDE_WINDOW_REASON = (
     "\u5339\u914d\u65e5\u5fd7\u51fa\u73b0\u5728\u6210\u529f\u7a97\u53e3\u5916\uff0c\u5ef6\u8fdf {latency_ms:.1f} ms"
 )
+RECORDING_GUARD_PROPERTY = "emdoor.video.state"
+RECORDING_GUARD_RECOVERY_ACTION = "ADB BACK"
+RECORDING_GUARD_SKIP_REASON = "检测到录像态，已执行 BACK 并跳过本轮"
 
 
 @dataclass(slots=True)
@@ -92,6 +96,19 @@ class ActiveTrialWindow:
     matched_log_event: LogEvent | None = None
 
 
+@dataclass(slots=True)
+class RecordingGuardOutcome:
+    """Result of one Qualcomm recording-state guard check."""
+
+    state: str = ""
+    triggered: bool = False
+    recovery_action: str = ""
+    recovery_result: str = ""
+    status_override: str | None = None
+    failure_reason: str = ""
+    abort_reason: str | None = None
+
+
 class TestEngine:
     """统一的测试执行引擎，GUI 和 CLI 都通过它跑测试。"""
 
@@ -103,11 +120,13 @@ class TestEngine:
         dry_run: bool = False,
         audio_backend=None,
         log_source_factory=None,
+        adb_controller_factory=None,
     ):
         self.config = config
         self.dry_run = dry_run
         self.audio_backend = audio_backend or create_audio_backend(dry_run=dry_run)
         self.log_source_factory = log_source_factory or create_log_source
+        self.adb_controller_factory = adb_controller_factory or create_adb_controller
         self._asset_cache: dict[str, AudioAsset] = {}
         self._events: list[LogEvent] = []
         self._trial_results: list[TrialResult] = []
@@ -118,6 +137,7 @@ class TestEngine:
         self._fatal_error: Exception | None = None
         self._stop_requested = threading.Event()
         self._log_source = None
+        self._adb_controller = None
 
     @property
     def events(self) -> list[LogEvent]:
@@ -337,11 +357,42 @@ class TestEngine:
             messages.append(self._describe_match_rule(rule, index))
         return messages
 
+    def _is_recording_guard_applicable(self) -> bool:
+        """Return whether the Qualcomm recording-state guard can run on this config."""
+        return self.config.normalized_platform() == "qualcomm"
+
+    def _is_recording_guard_enabled(self) -> bool:
+        """Return whether the Qualcomm recording-state guard should run."""
+        return self._is_recording_guard_applicable() and self.config.recording_guard.enabled
+
+    def _build_recording_guard_messages(self) -> list[str]:
+        """Build human-readable status lines for the recording-state guard."""
+        if not self._is_recording_guard_applicable():
+            return ["录像态守护: 不适用（仅 Qualcomm 平台支持）"]
+        state_label = "启用" if self.config.recording_guard.enabled else "关闭"
+        return [
+            f"录像态守护: {state_label}",
+            f"录像态查询属性: {RECORDING_GUARD_PROPERTY}",
+            f"录像态恢复动作: {RECORDING_GUARD_RECOVERY_ACTION}",
+            f"录像态恢复等待: {self.config.recording_guard.settle_ms} ms",
+        ]
+
     def _describe_noise_playback_duration(self, duration_ms: int) -> str:
         """Render a per-scenario noise playback duration for status output."""
         if duration_ms <= 0:
             return "整场景（默认）"
         return f"{duration_ms} ms"
+
+    def _build_scenario_volume_messages(self, scenarios) -> list[str]:
+        """Build per-scenario effective gain details for precheck output."""
+        messages: list[str] = []
+        for scenario in scenarios:
+            messages.append(
+                f"场景 {scenario.name}: "
+                f"噪声音量 {format_gain_details(scenario.noise_gain_db)}, "
+                f"唤醒词音量 {format_gain_details(scenario.wakeup_gain_db)}"
+            )
+        return messages
 
     def _build_config_snapshot_messages(self) -> list[str]:
         """Build a full precheck snapshot of the active configuration."""
@@ -349,6 +400,107 @@ class TestEngine:
         if not snapshot:
             return []
         return ["\u5f53\u524d\u9884\u8bbe\u53c2\u6570\u5feb\u7167:"] + snapshot.splitlines()
+
+    def _append_runtime_event(
+        self,
+        callbacks: EngineCallbacks,
+        source: str,
+        raw_line: str,
+        *,
+        trial_label: str = "",
+    ) -> LogEvent:
+        """Append an engine-generated event to the shared event stream."""
+        event = LogEvent(
+            timestamp_monotonic=time.monotonic(),
+            timestamp_iso=local_now_iso(),
+            source=source,
+            raw_line=raw_line,
+            matched=False,
+            trial_label=trial_label,
+            matched_window=False,
+        )
+        self._events.append(event)
+        callbacks.log_event(event)
+        return event
+
+    def _create_adb_controller(self):
+        """Instantiate the Qualcomm adb controller when the guard is active."""
+        if not self._is_recording_guard_enabled():
+            return None
+        return self.adb_controller_factory(
+            platform=self.config.platform,
+            adb_serial=self.config.dut.adb_serial,
+            dry_run=self.dry_run,
+        )
+
+    def _check_recording_guard(
+        self,
+        callbacks: EngineCallbacks,
+        trial_label: str,
+        tick_callback: Callable[[], None] | None = None,
+    ) -> RecordingGuardOutcome | None:
+        """Check the Qualcomm recording state after one playback completes."""
+        if not self._is_recording_guard_enabled():
+            return None
+        if self._adb_controller is None:
+            self._adb_controller = self._create_adb_controller()
+        if self._adb_controller is None:
+            return None
+
+        try:
+            raw_state = str(self._adb_controller.get_property(RECORDING_GUARD_PROPERTY)).strip()
+        except Exception as exc:
+            return RecordingGuardOutcome(
+                recovery_result="QUERY_FAILED",
+                status_override=TRIAL_STATUS_ERROR,
+                failure_reason=f"录像态查询失败: {exc}",
+                abort_reason=f"录像态查询失败: {exc}",
+            )
+
+        normalized_state = raw_state.upper() if raw_state else "UNKNOWN"
+        self._append_runtime_event(
+            callbacks,
+            "recording_guard",
+            f"recording_state={normalized_state}",
+            trial_label=trial_label,
+        )
+        if normalized_state != "ON":
+            return RecordingGuardOutcome(state=normalized_state)
+
+        try:
+            self._adb_controller.send_back()
+        except Exception as exc:
+            self._append_runtime_event(
+                callbacks,
+                "recording_guard",
+                "recording_recovery_action=BACK_FAILED",
+                trial_label=trial_label,
+            )
+            return RecordingGuardOutcome(
+                state=normalized_state,
+                triggered=True,
+                recovery_action="BACK",
+                recovery_result="FAILED",
+                status_override=TRIAL_STATUS_ERROR,
+                failure_reason=f"录像态退出失败: {exc}",
+                abort_reason=f"录像态退出失败: {exc}",
+            )
+
+        self._append_runtime_event(
+            callbacks,
+            "recording_guard",
+            "recording_recovery_action=BACK",
+            trial_label=trial_label,
+        )
+        self._sleep_interruptible(self.config.recording_guard.settle_ms / 1000.0, tick_callback=tick_callback)
+        return RecordingGuardOutcome(
+            state=normalized_state,
+            triggered=True,
+            recovery_action="BACK",
+            recovery_result="RECOVERED",
+            status_override=TRIAL_STATUS_SKIPPED,
+            failure_reason=RECORDING_GUARD_SKIP_REASON,
+        )
 
     def precheck(self) -> list[str]:
         """执行运行前预检，并返回展示给用户的提示信息。"""
@@ -387,6 +539,7 @@ class TestEngine:
             messages.append(
                 f"场景 {scenario.name}: 噪声播放时长 {self._describe_noise_playback_duration(scenario.noise_playback_duration_ms)}"
             )
+        messages.extend(self._build_scenario_volume_messages(enabled))
         log_source = self.log_source_factory(
             platform=self.config.platform,
             serial_port=self.config.dut.serial_port,
@@ -395,8 +548,13 @@ class TestEngine:
             dry_run=self.dry_run,
         )
         log_source.precheck()
+        if self._is_recording_guard_enabled():
+            controller = self._create_adb_controller()
+            if controller is not None:
+                controller.precheck()
         messages.append("日志监听链路检查通过")
         messages.extend(self._build_match_rule_messages())
+        messages.extend(self._build_recording_guard_messages())
         messages.extend(self._build_config_snapshot_messages())
         return messages
 
@@ -549,6 +707,7 @@ class TestEngine:
         self._active_trial = None
         self._active_noise_handle = None
         self._active_playback_handle = None
+        self._adb_controller = None
 
         for message in self.precheck():
             callbacks.status(message)
@@ -571,6 +730,8 @@ class TestEngine:
             line_callback=lambda source, line: self._log_line(source, line, callbacks),
             error_callback=lambda exc: self._log_error(exc, callbacks),
         )
+        if self._is_recording_guard_enabled():
+            self._adb_controller = self._create_adb_controller()
 
         try:
             for scenario_index, scenario in enumerate(scenarios):
@@ -733,6 +894,15 @@ class TestEngine:
                             matched_event = active.matched_log_event
                             self._active_trial = None
                         self._clear_active_playback_handle(playback_handle)
+                        recording_guard = RecordingGuardOutcome()
+                        if playback_error is None and self._fatal_error is None and not self._stop_requested.is_set():
+                            recording_guard_result = self._check_recording_guard(
+                                callbacks,
+                                trial_label,
+                                tick_callback=stop_noise_if_due,
+                            )
+                            if recording_guard_result is not None:
+                                recording_guard = recording_guard_result
 
                         if playback_error is not None:
                             status = TRIAL_STATUS_ERROR
@@ -755,6 +925,14 @@ class TestEngine:
                             matched = False
                             matched_line = ""
                             abort_cursor = (scenario_index, trial_index + 1, "用户手动停止")
+                        elif recording_guard.status_override is not None:
+                            status = recording_guard.status_override
+                            failure_reason = recording_guard.failure_reason
+                            latency_ms = None
+                            matched = False
+                            matched_line = ""
+                            if recording_guard.abort_reason is not None:
+                                abort_cursor = (scenario_index, trial_index + 1, recording_guard.abort_reason)
                         elif matched_event is not None:
                             status = TRIAL_STATUS_PASS
                             failure_reason = ""
@@ -781,6 +959,10 @@ class TestEngine:
                             latency_ms=latency_ms,
                             matched_line=matched_line,
                             failure_reason=failure_reason,
+                            recording_guard_triggered=recording_guard.triggered,
+                            recording_guard_state=recording_guard.state,
+                            recording_guard_recovery_action=recording_guard.recovery_action,
+                            recording_guard_recovery_result=recording_guard.recovery_result,
                         )
                         self._trial_results.append(result)
                         started_trials += 1
@@ -825,6 +1007,7 @@ class TestEngine:
             if self._log_source is not None:
                 self._log_source.stop()
                 self._log_source = None
+            self._adb_controller = None
 
         # 不论成功、失败还是中断，都尽量输出完整报告，方便复盘。
         summary = write_reports(run_dir, self.config, self._trial_results, self._events)

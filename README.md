@@ -12,6 +12,8 @@ Windows Python tool for smart-glasses voice wakeup testing.
 - Batch scenario execution
 - GUI custom trial-count controls for selected, enabled, or all scenarios
 - Per-scenario noise playback duration with full-scene default compatibility
+- Qualcomm recording-state guard that skips rounds after accidental video entry
+- Exact per-scenario volume details derived from `noise_gain_db` / `wakeup_gain_db`
 - Success-rate and latency reports in `CSV + JSON + YAML`
 - `--dry-run` mode for pipeline validation without hardware
 
@@ -60,6 +62,21 @@ python main.py --list-adb-devices
 - Set it to a positive value to stop the noise loop early while the remaining wakeup trials continue.
 - Leave it unset or set it to `0` to keep the previous full-scene noise playback behavior.
 - Precheck output now shows the effective noise playback duration for every enabled scenario.
+
+## Exact Volume Details
+
+- The GUI now shows read-only per-scenario volume details for the currently selected rows.
+- The displayed value is derived only from `noise_gain_db` and `wakeup_gain_db`, for example `-3.0 dB (0.708x)`.
+- When multiple selected rows share the same gain, the GUI shows that shared exact value; otherwise it shows `混合值`.
+- This display reflects relative playback gain only and does not include the Windows system master volume.
+- Precheck output now prints the exact effective noise/wakeup gain for every enabled scenario.
+
+## Qualcomm Recording Guard
+
+- Enable `recording_guard.enabled` to query `adb shell getprop emdoor.video.state` after each wakeup playback.
+- When the property returns `ON`, the tool sends one `ADB BACK`, marks the current round as `SKIPPED`, and continues with the next round.
+- `recording_guard.settle_ms` controls how long the tool waits after `BACK` before continuing.
+- Precheck output now shows whether this guard is enabled and which property/action it will use.
 
 ## Bluetooth Notes
 

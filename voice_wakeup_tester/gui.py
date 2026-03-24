@@ -9,6 +9,7 @@ from .audio import (
     AudioDependencyError,
     AudioValidationError,
     create_audio_backend,
+    format_gain_details,
     format_output_device_label,
     normalize_output_device_selection,
 )
@@ -20,6 +21,7 @@ from .models import (
     AppConfig,
     AudioDeviceConfig,
     DutConfig,
+    RecordingGuardConfig,
     ScenarioConfig,
     TRIAL_STATUS_STOPPED,
     TimingConfig,
@@ -151,6 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dry_run = dry_run
         self._task_thread: QtCore.QThread | None = None
         self._task_worker: EngineWorker | None = None
+        self._scenario_table_refresh_guard = False
 
         self.setWindowTitle("智能眼镜语音唤醒率测试工具")
         self.resize(1480, 900)
@@ -245,9 +248,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.adb_serial_combo.setEditable(True)
         self.refresh_adb_button = QtWidgets.QPushButton("刷新 ADB")
         self.refresh_adb_button.clicked.connect(lambda: self._refresh_adb_devices(show_errors=True))
+        self.recording_guard_checkbox = QtWidgets.QCheckBox("启用录像态守护")
+        self.recording_guard_checkbox.setToolTip(
+            "每轮唤醒词播放结束后查询 emdoor.video.state；若为 ON，则执行 BACK 并跳过本轮。"
+        )
+        self.recording_guard_settle_spin = QtWidgets.QSpinBox()
+        self.recording_guard_settle_spin.setRange(0, 60000)
+        self.recording_guard_settle_spin.setSuffix(" ms")
+        self.recording_guard_settle_spin.setValue(1000)
         qualcomm_layout.addWidget(QtWidgets.QLabel("ADB 设备"), 0, 0)
         qualcomm_layout.addWidget(self.adb_serial_combo, 0, 1)
         qualcomm_layout.addWidget(self.refresh_adb_button, 0, 2)
+        qualcomm_layout.addWidget(self.recording_guard_checkbox, 1, 0, 1, 3)
+        qualcomm_layout.addWidget(QtWidgets.QLabel("恢复等待"), 2, 0)
+        qualcomm_layout.addWidget(self.recording_guard_settle_spin, 2, 1)
         form_layout.addRow(self.qualcomm_group)
 
         self.rules_edit = QtWidgets.QPlainTextEdit()
@@ -332,6 +346,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.custom_trials_hint_label = QtWidgets.QLabel("当前没有场景；设置的次数会用于后续新增场景。")
         self.custom_trials_hint_label.setWordWrap(True)
         scenario_layout.addWidget(self.custom_trials_hint_label)
+
+        volume_details_group = QtWidgets.QGroupBox("音量详情")
+        volume_details_layout = QtWidgets.QFormLayout(volume_details_group)
+        self.volume_details_scope_label = QtWidgets.QLabel("当前没有场景")
+        self.volume_details_scope_label.setWordWrap(True)
+        self.noise_volume_details_label = QtWidgets.QLabel("-")
+        self.wakeup_volume_details_label = QtWidgets.QLabel("-")
+        self.volume_details_hint_label = QtWidgets.QLabel("说明：这里显示场景增益对应的相对音量，不包含系统主音量。")
+        self.volume_details_hint_label.setWordWrap(True)
+        volume_details_layout.addRow("范围", self.volume_details_scope_label)
+        volume_details_layout.addRow("噪声", self.noise_volume_details_label)
+        volume_details_layout.addRow("唤醒词", self.wakeup_volume_details_label)
+        volume_details_layout.addRow("", self.volume_details_hint_label)
+        scenario_layout.addWidget(volume_details_group)
         left_layout.addWidget(scenario_group)
 
         self.add_scenario_button.clicked.connect(self._append_empty_scenario)
@@ -341,7 +369,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_selected_trials_button.clicked.connect(self._apply_custom_trials_to_selected)
         self.apply_enabled_trials_button.clicked.connect(self._apply_custom_trials_to_enabled)
         self.apply_all_trials_button.clicked.connect(self._apply_custom_trials_to_all)
-        self.scenario_table.itemSelectionChanged.connect(self._sync_custom_trials_from_selection)
+        self.scenario_table.itemSelectionChanged.connect(self._handle_scenario_selection_changed)
+        self.scenario_table.itemChanged.connect(self._handle_scenario_item_changed)
 
         action_row = QtWidgets.QHBoxLayout()
         self.load_config_button = QtWidgets.QPushButton("加载配置")
@@ -593,6 +622,9 @@ class MainWindow(QtWidgets.QMainWindow):
         platform = self.platform_combo.currentText()
         self.rtos_group.setVisible(platform == "rtos")
         self.qualcomm_group.setVisible(platform == "qualcomm")
+        recording_guard_enabled = platform == "qualcomm"
+        self.recording_guard_checkbox.setEnabled(recording_guard_enabled)
+        self.recording_guard_settle_spin.setEnabled(recording_guard_enabled)
 
     def _append_empty_scenario(self) -> None:
         """在场景表追加一条空白场景。"""
@@ -637,7 +669,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.scenario_table.setItem(row, SCENARIO_COL_TRIALS, QtWidgets.QTableWidgetItem(str(scenario.trials)))
         self.scenario_table.selectRow(row)
-        self._sync_custom_trials_from_selection()
+        if not self._scenario_table_refresh_guard:
+            self._handle_scenario_selection_changed()
 
     def _set_scenario_trials(self, row: int, trials: int) -> None:
         """更新指定场景行的试次数字。"""
@@ -660,6 +693,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if trials <= 0:
             return None
         return trials
+
+    def _scenario_gain_value(self, row: int, column: int) -> float | None:
+        """读取指定场景行的增益值；无效时返回 `None`。"""
+        item = self.scenario_table.item(row, column)
+        raw_text = item.text().strip() if item is not None else "0"
+        try:
+            return float(raw_text or 0.0)
+        except ValueError:
+            return None
 
     def _selected_scenario_rows(self) -> list[int]:
         """返回当前多选场景行号，结果去重并按表格顺序排序。"""
@@ -694,6 +736,67 @@ class MainWindow(QtWidgets.QMainWindow):
     def _remember_custom_trials_input(self, value: int) -> None:
         """记住用户最近一次手动输入的自定义次数。"""
         self._custom_trials_user_value = value
+
+    def _set_volume_details(self, scope_text: str, noise_text: str, wakeup_text: str) -> None:
+        """统一回填场景音量详情文案。"""
+        self.volume_details_scope_label.setText(scope_text)
+        self.noise_volume_details_label.setText(noise_text)
+        self.wakeup_volume_details_label.setText(wakeup_text)
+
+    def _summarize_selected_gain(self, rows: list[int], column: int) -> str:
+        """汇总当前选中场景在某个增益列上的显示文案。"""
+        gain_values: list[float] = []
+        for row in rows:
+            gain_value = self._scenario_gain_value(row, column)
+            if gain_value is None:
+                return "无效值"
+            gain_values.append(gain_value)
+        unique_values = {round(value, 6) for value in gain_values}
+        if len(unique_values) == 1:
+            return format_gain_details(gain_values[0])
+        return "混合值"
+
+    def _refresh_volume_details(self) -> None:
+        """根据当前选择刷新只读音量详情。"""
+        selected_rows = self._selected_scenario_rows()
+        if not selected_rows:
+            if self.scenario_table.rowCount() == 0:
+                self._set_volume_details("当前没有场景", "-", "-")
+            else:
+                self._set_volume_details("未选中场景", "-", "-")
+            return
+
+        if len(selected_rows) == 1:
+            name_item = self.scenario_table.item(selected_rows[0], SCENARIO_COL_NAME)
+            scenario_name = name_item.text().strip() if name_item is not None else f"scene_{selected_rows[0] + 1}"
+            scope_text = f"当前场景：{scenario_name}"
+        else:
+            scope_text = f"已选 {len(selected_rows)} 条场景"
+
+        self._set_volume_details(
+            scope_text,
+            self._summarize_selected_gain(selected_rows, SCENARIO_COL_NOISE_GAIN),
+            self._summarize_selected_gain(selected_rows, SCENARIO_COL_WAKEUP_GAIN),
+        )
+
+    def _handle_scenario_selection_changed(self) -> None:
+        """在场景选择变化时同步次数提示和音量详情。"""
+        self._sync_custom_trials_from_selection()
+        self._refresh_volume_details()
+
+    def _handle_scenario_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        """在关键列变更后刷新派生展示。"""
+        if self._scenario_table_refresh_guard:
+            return
+        if item.column() in {
+            SCENARIO_COL_NAME,
+            SCENARIO_COL_ENABLED,
+            SCENARIO_COL_NOISE_GAIN,
+            SCENARIO_COL_WAKEUP_GAIN,
+            SCENARIO_COL_TRIALS,
+        }:
+            self._sync_custom_trials_from_selection()
+            self._refresh_volume_details()
 
     def _sync_custom_trials_from_selection(self) -> None:
         """根据当前选中场景回填或提示自定义次数状态。"""
@@ -777,7 +880,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.scenario_table.currentRow()
         if row >= 0:
             self.scenario_table.removeRow(row)
-            self._sync_custom_trials_from_selection()
+            self._handle_scenario_selection_changed()
 
     def _browse_scenario_file(self, column: int) -> None:
         """为当前行选择噪声或唤醒词 WAV 文件。"""
@@ -874,6 +977,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 trial_interval_ms=self.trial_interval_spin.value(),
                 success_window_ms=self.success_window_spin.value(),
             ),
+            recording_guard=RecordingGuardConfig(
+                enabled=self.recording_guard_checkbox.isChecked(),
+                settle_ms=self.recording_guard_settle_spin.value(),
+            ),
             scenarios=scenarios,
             allow_same_device=self.allow_same_device_checkbox.isChecked(),
             output_root=self.output_root_edit.text().strip(),
@@ -894,16 +1001,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pre_noise_spin.setValue(config.timing.pre_noise_roll_ms)
         self.trial_interval_spin.setValue(config.timing.trial_interval_ms)
         self.success_window_spin.setValue(config.timing.success_window_ms)
+        self.recording_guard_checkbox.setChecked(config.recording_guard.enabled)
+        self.recording_guard_settle_spin.setValue(config.recording_guard.settle_ms)
         self.allow_same_device_checkbox.setChecked(config.allow_same_device)
         self.output_root_edit.setText(config.output_root)
+        self._scenario_table_refresh_guard = True
         self.scenario_table.setRowCount(0)
         for scenario in config.scenarios:
             self._append_scenario_row(scenario)
+        self._scenario_table_refresh_guard = False
         if self.scenario_table.rowCount() > 0:
             self.scenario_table.selectRow(0)
-            self._sync_custom_trials_from_selection()
-        else:
-            self._sync_custom_trials_from_selection()
+        self._handle_scenario_selection_changed()
         self._update_platform_visibility()
 
     def _load_config_from_file(self) -> None:

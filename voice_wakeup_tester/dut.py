@@ -35,6 +35,47 @@ class AdbDevice:
     state: str
 
 
+class AdbCommandClient:
+    """Shared adb command wrapper bound to one configured device."""
+
+    def __init__(self, adb_serial: str):
+        self._adb_serial = adb_serial
+
+    def adb_prefix(self) -> list[str]:
+        """Build the adb command prefix bound to the configured device."""
+        if not self._adb_serial:
+            raise LogSourceError("Qualcomm platform requires an adb_serial.")
+        return ["adb", "-s", self._adb_serial]
+
+    def run(self, *args: str) -> subprocess.CompletedProcess:
+        """Run a short adb command with consistent encoding/error handling."""
+        return subprocess.run(
+            [*self.adb_prefix(), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    def probe_state(self) -> tuple[int, str]:
+        """Read the current adb device state for diagnostics."""
+        result = self.run("get-state")
+        if result.returncode == 0:
+            return result.returncode, result.stdout.strip() or "unknown"
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown"
+        return result.returncode, detail
+
+    def precheck(self) -> None:
+        """Verify the adb device is ready before starting the run."""
+        result = self.run("get-state")
+        state = result.stdout.strip()
+        if result.returncode != 0:
+            raise LogSourceError(result.stderr.strip() or state or "adb get-state failed.")
+        if state != "device":
+            raise LogSourceError(f"adb device is not ready: {state or 'unknown'}")
+
+
 def list_serial_port_names() -> list[str]:
     """List currently visible serial ports on the host."""
     if list_ports is None:
@@ -138,7 +179,7 @@ class AdbLogcatSource(BaseLogSource):
     """Streaming `adb logcat` listener used by the Qualcomm platform."""
 
     def __init__(self, adb_serial: str):
-        self._adb_serial = adb_serial
+        self._adb = AdbCommandClient(adb_serial)
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stop_requested = threading.Event()
@@ -147,20 +188,11 @@ class AdbLogcatSource(BaseLogSource):
 
     def _adb_prefix(self) -> list[str]:
         """Build the adb command prefix bound to the configured device."""
-        if not self._adb_serial:
-            raise LogSourceError("Qualcomm platform requires an adb_serial.")
-        return ["adb", "-s", self._adb_serial]
+        return self._adb.adb_prefix()
 
     def _run_adb(self, *args: str) -> subprocess.CompletedProcess:
         """Run a short adb command with consistent encoding/error handling."""
-        return subprocess.run(
-            [*self._adb_prefix(), *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        return self._adb.run(*args)
 
     def _probe_adb_state(self) -> tuple[int, str]:
         """Read the current adb device state for diagnostics."""
@@ -298,6 +330,51 @@ class SyntheticLogSource(BaseLogSource):
         self._timers.clear()
 
 
+class QualcommAdbController:
+    """Small command helper used for Qualcomm runtime recovery actions."""
+
+    def __init__(self, adb_serial: str):
+        self._adb = AdbCommandClient(adb_serial)
+
+    def precheck(self) -> None:
+        """Verify the adb device is ready before using recovery commands."""
+        self._adb.precheck()
+
+    def get_property(self, name: str) -> str:
+        """Read one Android system property from the connected device."""
+        result = self._adb.run("shell", "getprop", name)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "adb shell getprop failed."
+            raise LogSourceError(detail)
+        return result.stdout.strip()
+
+    def send_back(self) -> None:
+        """Send one BACK key event to the connected device."""
+        result = self._adb.run("shell", "input", "keyevent", "KEYCODE_BACK")
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "adb shell input keyevent failed."
+            raise LogSourceError(detail)
+
+
+class SyntheticQualcommAdbController:
+    """Fake Qualcomm controller used by dry-run mode and tests."""
+
+    def __init__(self, property_value: str = "OFF"):
+        self._property_value = property_value
+        self.back_calls = 0
+
+    def precheck(self) -> None:
+        return None
+
+    def get_property(self, name: str) -> str:
+        if name != "emdoor.video.state":
+            raise LogSourceError(f"Unsupported synthetic property: {name}")
+        return self._property_value
+
+    def send_back(self) -> None:
+        self.back_calls += 1
+
+
 def create_log_source(platform: str, serial_port: str, baudrate: int, adb_serial: str, dry_run: bool):
     """Create the log source that matches the configured platform/mode."""
     normalized = platform.strip().lower()
@@ -308,3 +385,13 @@ def create_log_source(platform: str, serial_port: str, baudrate: int, adb_serial
     if normalized == "qualcomm":
         return AdbLogcatSource(adb_serial)
     raise LogSourceError(f"Unsupported platform: {platform}")
+
+
+def create_adb_controller(platform: str, adb_serial: str, dry_run: bool):
+    """Create the adb controller used by Qualcomm-only runtime helpers."""
+    normalized = platform.strip().lower()
+    if normalized != "qualcomm":
+        return None
+    if dry_run:
+        return SyntheticQualcommAdbController()
+    return QualcommAdbController(adb_serial)

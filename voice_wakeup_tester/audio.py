@@ -57,7 +57,7 @@ class AudioAsset:
         """对样本应用 dB 增益并返回新对象。"""
         if abs(gain_db) < 1e-9:
             return self
-        gain = float(10 ** (gain_db / 20.0))
+        gain = gain_db_to_multiplier(gain_db)
         boosted = np.clip(self.samples * gain, -1.0, 1.0).astype(np.float32, copy=False)
         return AudioAsset(
             path=self.path,
@@ -65,6 +65,18 @@ class AudioAsset:
             channels=self.channels,
             samples=boosted,
         )
+
+
+def gain_db_to_multiplier(gain_db: float) -> float:
+    """Convert a dB gain value into a linear playback multiplier."""
+    normalized_gain = 0.0 if abs(gain_db) < 1e-9 else float(gain_db)
+    return float(10 ** (normalized_gain / 20.0))
+
+
+def format_gain_details(gain_db: float) -> str:
+    """Render one gain value as dB plus linear multiplier for UI/precheck output."""
+    normalized_gain = 0.0 if abs(gain_db) < 1e-9 else float(gain_db)
+    return f"{normalized_gain:.1f} dB ({gain_db_to_multiplier(normalized_gain):.3f}x)"
 
 
 def _require_sounddevice():

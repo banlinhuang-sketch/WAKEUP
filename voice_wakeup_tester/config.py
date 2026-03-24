@@ -12,6 +12,7 @@ from .models import (
     AudioDeviceConfig,
     DutConfig,
     MatchRule,
+    RecordingGuardConfig,
     ScenarioConfig,
     TimingConfig,
 )
@@ -37,6 +38,7 @@ def default_config(platform: str = "rtos", base_dir: str | Path | None = None) -
         audio_devices=AudioDeviceConfig(),
         match_rules=[MatchRule(**rule.to_dict()) for rule in DEFAULT_RULES[platform]],
         timing=TimingConfig(),
+        recording_guard=RecordingGuardConfig(),
         scenarios=[
             ScenarioConfig(
                 name="default_scene",
@@ -152,6 +154,7 @@ def config_from_dict(data: dict[str, Any], base_dir: str | Path | None = None) -
     dut_data = data.get("dut", {}) or {}
     audio_data = data.get("audio_devices", {}) or {}
     timing_data = data.get("timing", {}) or {}
+    recording_guard_data = data.get("recording_guard", {}) or {}
     config = AppConfig(
         platform=platform,
         dut=DutConfig(
@@ -168,6 +171,10 @@ def config_from_dict(data: dict[str, Any], base_dir: str | Path | None = None) -
             pre_noise_roll_ms=int(timing_data.get("pre_noise_roll_ms", base.timing.pre_noise_roll_ms)),
             trial_interval_ms=int(timing_data.get("trial_interval_ms", base.timing.trial_interval_ms)),
             success_window_ms=int(timing_data.get("success_window_ms", base.timing.success_window_ms)),
+        ),
+        recording_guard=RecordingGuardConfig(
+            enabled=bool(recording_guard_data.get("enabled", base.recording_guard.enabled)),
+            settle_ms=max(int(recording_guard_data.get("settle_ms", base.recording_guard.settle_ms)), 0),
         ),
         scenarios=_parse_scenarios(data.get("scenarios")) or base.scenarios,
         allow_same_device=bool(data.get("allow_same_device", False)),

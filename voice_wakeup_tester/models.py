@@ -71,6 +71,21 @@ class TimingConfig:
 
 
 @dataclass(slots=True)
+class RecordingGuardConfig:
+    """Qualcomm 录像态守护配置。"""
+
+    enabled: bool = False
+    settle_ms: int = 1000
+
+    def to_dict(self) -> dict[str, Any]:
+        """转成可序列化字典。"""
+        return {
+            "enabled": self.enabled,
+            "settle_ms": self.settle_ms,
+        }
+
+
+@dataclass(slots=True)
 class ScenarioConfig:
     """单条测试场景配置。"""
 
@@ -138,6 +153,7 @@ class AppConfig:
     audio_devices: AudioDeviceConfig = field(default_factory=AudioDeviceConfig)
     match_rules: list[MatchRule] = field(default_factory=list)
     timing: TimingConfig = field(default_factory=TimingConfig)
+    recording_guard: RecordingGuardConfig = field(default_factory=RecordingGuardConfig)
     scenarios: list[ScenarioConfig] = field(default_factory=list)
     allow_same_device: bool = False
     output_root: str = ""
@@ -154,6 +170,8 @@ class AppConfig:
             raise ValueError(f"Unsupported platform: {self.platform}")
         if not self.scenarios:
             raise ValueError("At least one scenario is required.")
+        if self.recording_guard.settle_ms < 0:
+            raise ValueError("recording_guard.settle_ms must be non-negative.")
 
     def to_dict(self) -> dict[str, Any]:
         """转成可序列化字典。"""
@@ -163,6 +181,7 @@ class AppConfig:
             "audio_devices": self.audio_devices.to_dict(),
             "match_rules": [rule.to_dict() for rule in self.match_rules],
             "timing": self.timing.to_dict(),
+            "recording_guard": self.recording_guard.to_dict(),
             "scenarios": [scenario.to_dict() for scenario in self.scenarios],
             "allow_same_device": self.allow_same_device,
             "output_root": self.output_root,
@@ -209,6 +228,10 @@ class TrialResult:
     latency_ms: float | None = None
     matched_line: str = ""
     failure_reason: str = ""
+    recording_guard_triggered: bool = False
+    recording_guard_state: str = ""
+    recording_guard_recovery_action: str = ""
+    recording_guard_recovery_result: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """转成可序列化字典。"""
@@ -224,4 +247,8 @@ class TrialResult:
             "latency_ms": round(self.latency_ms, 3) if self.latency_ms is not None else "",
             "matched_line": self.matched_line,
             "failure_reason": self.failure_reason,
+            "recording_guard_triggered": self.recording_guard_triggered,
+            "recording_guard_state": self.recording_guard_state,
+            "recording_guard_recovery_action": self.recording_guard_recovery_action,
+            "recording_guard_recovery_result": self.recording_guard_recovery_result,
         }
