@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 import sys
 
+from . import APP_TITLE, DISPLAY_VERSION, __version__
 from .audio import (
     AudioDependencyError,
     AudioValidationError,
@@ -20,7 +21,7 @@ from .engine import EngineCallbacks, TestEngine
 
 def build_parser() -> argparse.ArgumentParser:
     """定义 CLI 参数接口。"""
-    parser = argparse.ArgumentParser(description="Voice wakeup tester for smart glasses.")
+    parser = argparse.ArgumentParser(description=APP_TITLE)
     parser.add_argument("--config", help="Path to YAML config file.")
     parser.add_argument("--platform", choices=["rtos", "qualcomm"], help="Override platform from YAML.")
     parser.add_argument("--headless", action="store_true", help="Run without launching the GUI.")
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-serial-ports", action="store_true", help="List available serial ports.")
     parser.add_argument("--list-adb-devices", action="store_true", help="List available adb devices.")
     parser.add_argument("--dry-run", action="store_true", help="Use synthetic log/audio backends.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {DISPLAY_VERSION} ({__version__})")
     return parser
 
 
@@ -41,7 +43,7 @@ def _load_requested_config(args: argparse.Namespace):
 
 
 def _print_audio_devices() -> int:
-    """列出可用于人工嘴/噪声输出的声卡设备。"""
+    """列出可用于人工嘴和噪声音箱的输出设备。"""
     try:
         devices = list_output_devices()
     except AudioDependencyError as exc:
@@ -115,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.headless:
         return _run_headless(args)
 
-    # GUI 模块依赖 PySide6，因此只在真正需要时再导入。
+    # GUI 模式依赖 PySide6，因此只在真正需要时再导入。
     from .gui import launch_gui
 
     config = _load_requested_config(args) if args.config or args.platform else None

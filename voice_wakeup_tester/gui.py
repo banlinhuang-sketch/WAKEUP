@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import traceback
 
+from . import APP_TITLE
 from .audio import (
     AudioDependencyError,
     AudioValidationError,
@@ -156,6 +157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scenario_table_refresh_guard = False
 
         self.setWindowTitle("智能眼镜语音唤醒率测试工具")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1480, 900)
         self._build_ui()
 

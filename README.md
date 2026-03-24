@@ -1,6 +1,8 @@
-# Voice Wakeup Tester
+# Voice Wakeup Tester V2.0
 
 Windows Python tool for smart-glasses voice wakeup testing.
+
+Current desktop release: `V2.0`
 
 中文使用文档见 [使用文档](使用文档.md)。
 
@@ -43,6 +45,7 @@ python main.py --config sample_config.yaml --headless --dry-run
 ## Utility Commands
 
 ```powershell
+python main.py --version
 python main.py --list-audio-devices
 python main.py --list-serial-ports
 python main.py --list-adb-devices

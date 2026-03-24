@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import ctypes
+from pathlib import Path
 import sys
 import traceback
+
+from voice_wakeup_tester import APP_TITLE
 
 
 def _startup_log_path() -> Path:
@@ -16,7 +18,7 @@ def _startup_log_path() -> Path:
 
 
 def _write_startup_error_log(traceback_text: str) -> Path:
-    """把启动阶段的异常信息写入日志文件。"""
+    """把启动阶段异常写入日志文件。"""
     log_path = _startup_log_path()
     log_path.write_text(traceback_text, encoding="utf-8")
     return log_path
@@ -27,7 +29,7 @@ def _show_startup_error(message: str) -> None:
     if sys.platform != "win32":
         return
     try:
-        ctypes.windll.user32.MessageBoxW(None, message, "voice_wakeup_tester 启动失败", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, message, f"{APP_TITLE} 启动失败", 0x10)
     except Exception:
         pass
 

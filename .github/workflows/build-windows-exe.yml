@@ -51,7 +51,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          $zipPath = "release/voice_wakeup_tester-windows-x64.zip"
+          $zipPath = "release/voice_wakeup_tester-v2.0-windows-x64.zip"
           if (Test-Path $zipPath) {
             Remove-Item $zipPath -Force
           }
@@ -60,8 +60,8 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: voice_wakeup_tester-windows-x64
-          path: release/voice_wakeup_tester-windows-x64.zip
+          name: voice_wakeup_tester-v2.0-windows-x64
+          path: release/voice_wakeup_tester-v2.0-windows-x64.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -74,7 +74,7 @@ jobs:
           $tag = "${{ github.ref_name }}"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag release/voice_wakeup_tester-windows-x64.zip --clobber
+            gh release upload $tag release/voice_wakeup_tester-v2.0-windows-x64.zip --clobber
           } else {
-            gh release create $tag release/voice_wakeup_tester-windows-x64.zip --title $tag --notes "Automated Windows build for voice_wakeup_tester."
+            gh release create $tag release/voice_wakeup_tester-v2.0-windows-x64.zip --title $tag --notes "Automated Windows build for voice_wakeup_tester V2.0."
           }
